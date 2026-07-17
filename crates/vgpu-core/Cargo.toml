@@ -1,0 +1,13 @@
+[package]
+name = "vgpu-core"
+description = "Device model for VGPU-X: virtual GPUs, GPU memory virtualization, command rings, and a fair-share scheduler, simulated deterministically in userspace."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Intentionally empty. See workspace Cargo.toml for the rationale.
+
+[lints]
+workspace = true
