@@ -1,0 +1,404 @@
+//! # vgpu-fabric — the control plane (Milestone 4)
+//!
+//! The last layer: a fleet of `vgpud` nodes becomes *one pool of GPU
+//! capacity*. The fabric answers exactly three questions, and its API is
+//! those three questions and their bookkeeping:
+//!
+//! 1. **Where should this tenant run?** — [`Fabric::place`]: best-fit
+//!    bin-packing over profile VRAM budgets.
+//! 2. **What is running where?** — [`Fabric::inventory`]: live node
+//!    reports plus the tenant registry.
+//! 3. **How do I move things?** — [`Fabric::migrate_tenant`] and
+//!    [`Fabric::evacuate`] (drain a node for maintenance), both built on
+//!    milestone 3's live migration.
+//!
+//! # Control plane vs data plane
+//!
+//! The fabric *places* tenants; it does not proxy their work. A guest
+//! gets back a [`TenantHandle`] — node address + vGPU id — and talks to
+//! that node directly (through `VgpuClient` or the milestone-2 shim).
+//! This split is why every serious fleet system looks the same
+//! (Kubernetes doesn't proxy your pod's packets; a GPU fabric must not
+//! proxy doorbell writes): the control plane is on the slow path where
+//! policy lives, and adding a tenant never adds load to placement.
+//!
+//! # Why placement is tractable at all
+//!
+//! Milestone 0 chose *fixed profiles* over per-resource dials, promising
+//! it would "make placement decidable for a fabric scheduler: it can
+//! pack profiles onto cards like Tetris pieces". This crate is where
+//! that promise is kept: because a tenant's VRAM demand is a single
+//! known number (the profile budget, guaranteed by node admission
+//! control), placement is classic bin-packing, and a one-line best-fit
+//! rule gives a good, *deterministic* answer. Had tenants carried
+//! elastic demands, this file would be a capacity estimator, a load
+//! predictor, and a regret minimizer. Constraints chosen early are the
+//! reason later layers stay small.
+//!
+//! # State ownership, honestly
+//!
+//! The registry (which tenant is on which node) lives in the fabric; the
+//! *truth* (what a node is actually running) lives on the nodes. The
+//! fabric keeps them consistent by being the only actor that places,
+//! migrates, or destroys — the single-writer discipline, the same move
+//! the daemon made with its device thread. What this milestone does NOT
+//! implement, on purpose: fabric HA/consensus (a second fabric instance
+//! would break single-writer), node-failure detection, and reconciling
+//! external mutations behind the fabric's back. Those are real problems
+//! with real literature (Raft, cell architectures); noting the boundary
+//! is the honest move.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::net::SocketAddr;
+
+use vgpu_core::types::VgpuId;
+use vgpu_core::vgpu::VgpuProfile;
+use vgpu_proto::{migrate, ClientError, MigrateError, MigrateOptions, VgpuClient};
+
+/// Identifies a node within this fabric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(pub u32);
+
+/// Fabric-global tenant identity — *stable across migrations*, which is
+/// the point: `(NodeId, VgpuId)` changes when a tenant moves; the
+/// `TenantId` a client holds does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TenantId(pub u32);
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "node{}", self.0)
+    }
+}
+
+impl fmt::Display for TenantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tenant{}", self.0)
+    }
+}
+
+/// Where a tenant's work actually goes: the data-plane coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantHandle {
+    /// Fabric-stable identity.
+    pub tenant: TenantId,
+    /// Node currently hosting the vGPU.
+    pub node: NodeId,
+    /// Address guests connect to for submissions and DMA.
+    pub addr: SocketAddr,
+    /// The vGPU id on that node.
+    pub vgpu: VgpuId,
+}
+
+/// One node's live standing plus the fabric's view of it.
+#[derive(Debug, Clone)]
+pub struct NodeReport {
+    /// Fabric id.
+    pub node: NodeId,
+    /// Card name as the node reports it.
+    pub name: String,
+    /// Data-plane address.
+    pub addr: SocketAddr,
+    /// Total VRAM on the card.
+    pub vram_bytes: u64,
+    /// VRAM not committed to any profile (live, from the node).
+    pub uncommitted_vram: u64,
+    /// Tenants the fabric has placed here.
+    pub tenants: Vec<TenantId>,
+}
+
+/// Control-plane failures.
+#[derive(Debug)]
+pub enum FabricError {
+    /// RPC to a node failed.
+    Client(ClientError),
+    /// A migration failed (source left intact; registry unchanged).
+    Migrate(MigrateError),
+    /// No node has enough uncommitted VRAM for this profile.
+    NoCapacity {
+        /// Bytes the profile requires.
+        requested: u64,
+        /// The largest uncommitted VRAM any node currently offers.
+        best_available: u64,
+    },
+    /// Unknown node id.
+    NoSuchNode(NodeId),
+    /// Unknown tenant id.
+    NoSuchTenant(TenantId),
+    /// Evacuation/migration had no eligible destination node.
+    NoDestination,
+}
+
+impl fmt::Display for FabricError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Client(e) => write!(f, "node rpc failed: {e}"),
+            Self::Migrate(e) => write!(f, "migration failed: {e}"),
+            Self::NoCapacity {
+                requested,
+                best_available,
+            } => write!(
+                f,
+                "no node can host {requested} B (best available: {best_available} B)"
+            ),
+            Self::NoSuchNode(n) => write!(f, "no such node: {n}"),
+            Self::NoSuchTenant(t) => write!(f, "no such tenant: {t}"),
+            Self::NoDestination => write!(f, "no eligible destination node"),
+        }
+    }
+}
+
+impl std::error::Error for FabricError {}
+
+impl From<ClientError> for FabricError {
+    fn from(e: ClientError) -> Self {
+        Self::Client(e)
+    }
+}
+
+impl From<MigrateError> for FabricError {
+    fn from(e: MigrateError) -> Self {
+        Self::Migrate(e)
+    }
+}
+
+/// Fabric result alias.
+pub type FabricResult<T> = Result<T, FabricError>;
+
+struct Node {
+    addr: SocketAddr,
+}
+
+struct Placement {
+    node: NodeId,
+    vgpu: VgpuId,
+    profile: VgpuProfile,
+}
+
+/// The control plane. Owns the registry; opens short-lived connections
+/// to nodes per operation.
+///
+/// Per-operation connections rather than held ones is a deliberate
+/// control-plane idiom: placement and migration are rare, so connection
+/// cost is noise, and the fabric never pins a node's connection slot or
+/// holds a stream across a long migration — the data plane's steady
+/// traffic belongs to guests.
+pub struct Fabric {
+    nodes: BTreeMap<NodeId, Node>,
+    tenants: BTreeMap<TenantId, Placement>,
+    next_node: u32,
+    next_tenant: u32,
+    migrate_opts: MigrateOptions,
+}
+
+impl Fabric {
+    /// An empty fabric.
+    pub fn new() -> Self {
+        Self {
+            nodes: BTreeMap::new(),
+            tenants: BTreeMap::new(),
+            next_node: 0,
+            next_tenant: 0,
+            migrate_opts: MigrateOptions::default(),
+        }
+    }
+
+    /// Register a node by address. Verifies it is reachable and speaking
+    /// our protocol (a `node_info` roundtrip) before admitting it to the
+    /// pool — a fabric must never *discover* mid-placement that a node
+    /// was never real.
+    pub fn add_node(&mut self, addr: SocketAddr) -> FabricResult<NodeId> {
+        self.connect(addr)?.node_info()?;
+        let id = NodeId(self.next_node);
+        self.next_node += 1;
+        self.nodes.insert(id, Node { addr });
+        Ok(id)
+    }
+
+    /// Live inventory: per-node standing (fresh `node_info`, not cached —
+    /// capacity questions deserve current answers) plus the registry.
+    pub fn inventory(&mut self) -> FabricResult<Vec<NodeReport>> {
+        let mut reports = Vec::with_capacity(self.nodes.len());
+        for (&id, node) in &self.nodes {
+            let info = self.connect(node.addr)?.node_info()?;
+            reports.push(NodeReport {
+                node: id,
+                name: info.name,
+                addr: node.addr,
+                vram_bytes: info.vram_bytes,
+                uncommitted_vram: info.uncommitted_vram,
+                tenants: self
+                    .tenants
+                    .iter()
+                    .filter(|(_, p)| p.node == id)
+                    .map(|(t, _)| *t)
+                    .collect(),
+            });
+        }
+        Ok(reports)
+    }
+
+    /// Place a tenant: choose a node by **best fit**, admit, start.
+    ///
+    /// Best fit = the node whose uncommitted VRAM exceeds the request by
+    /// the *least* (ties broken by `NodeId` — determinism, as everywhere).
+    /// Why best-fit and not first-fit or most-free ("worst fit")? Packing
+    /// tightly preserves the largest contiguous capacities for the large
+    /// profiles that only few nodes can host: spreading a small tenant
+    /// onto the emptiest node is exactly how a fleet ends up with 40%
+    /// free VRAM and nowhere to put one big tenant. (Best-fit is not
+    /// optimal — bin packing is NP-hard — but it is the classic
+    /// good-and-explainable answer, and profiles make even the greedy
+    /// rule effective.)
+    pub fn place(&mut self, profile: VgpuProfile) -> FabricResult<TenantHandle> {
+        let node = self.best_fit(profile.vram_bytes, None)?;
+        let addr = self.nodes[&node].addr;
+        let mut client = self.connect(addr)?;
+        let vgpu = client.create_vgpu(profile.clone())?;
+        client.start_vgpu(vgpu)?;
+
+        let tenant = TenantId(self.next_tenant);
+        self.next_tenant += 1;
+        self.tenants.insert(
+            tenant,
+            Placement {
+                node,
+                vgpu,
+                profile,
+            },
+        );
+        Ok(TenantHandle {
+            tenant,
+            node,
+            addr,
+            vgpu,
+        })
+    }
+
+    /// The data-plane coordinates for a tenant (current node + vGPU id).
+    pub fn handle(&self, tenant: TenantId) -> FabricResult<TenantHandle> {
+        let p = self
+            .tenants
+            .get(&tenant)
+            .ok_or(FabricError::NoSuchTenant(tenant))?;
+        Ok(TenantHandle {
+            tenant,
+            node: p.node,
+            addr: self.nodes[&p.node].addr,
+            vgpu: p.vgpu,
+        })
+    }
+
+    /// Tear a tenant down and release its slot.
+    pub fn destroy(&mut self, tenant: TenantId) -> FabricResult<()> {
+        let p = self
+            .tenants
+            .get(&tenant)
+            .ok_or(FabricError::NoSuchTenant(tenant))?;
+        let addr = self.nodes[&p.node].addr;
+        let vgpu = p.vgpu;
+        self.connect(addr)?.destroy_vgpu(vgpu)?;
+        self.tenants.remove(&tenant);
+        Ok(())
+    }
+
+    /// Live-migrate one tenant to a specific node. The registry updates
+    /// only after the migration succeeds — on failure the source is
+    /// intact (milestone 3's contract) and the fabric's view unchanged.
+    pub fn migrate_tenant(&mut self, tenant: TenantId, to: NodeId) -> FabricResult<TenantHandle> {
+        if !self.nodes.contains_key(&to) {
+            return Err(FabricError::NoSuchNode(to));
+        }
+        let p = self
+            .tenants
+            .get(&tenant)
+            .ok_or(FabricError::NoSuchTenant(tenant))?;
+        let (src_addr, src_vgpu) = (self.nodes[&p.node].addr, p.vgpu);
+        let dst_addr = self.nodes[&to].addr;
+
+        let mut src = self.connect(src_addr)?;
+        let mut dst = self.connect(dst_addr)?;
+        let twin = migrate(&mut src, &mut dst, src_vgpu, &self.migrate_opts)?;
+
+        let p = self.tenants.get_mut(&tenant).expect("checked above");
+        p.node = to;
+        p.vgpu = twin;
+        Ok(TenantHandle {
+            tenant,
+            node: to,
+            addr: dst_addr,
+            vgpu: twin,
+        })
+    }
+
+    /// Drain a node: live-migrate every tenant it hosts to the best-fit
+    /// *other* node. Returns how many tenants moved. Tenants move one at
+    /// a time with the registry updated after each, so a mid-drain
+    /// failure leaves a consistent (partially drained) fabric, never a
+    /// lost tenant.
+    pub fn evacuate(&mut self, node: NodeId) -> FabricResult<u32> {
+        if !self.nodes.contains_key(&node) {
+            return Err(FabricError::NoSuchNode(node));
+        }
+        let residents: Vec<TenantId> = self
+            .tenants
+            .iter()
+            .filter(|(_, p)| p.node == node)
+            .map(|(t, _)| *t)
+            .collect();
+        let mut moved = 0;
+        for tenant in residents {
+            let bytes = self.tenants[&tenant].profile.vram_bytes;
+            let dest = self
+                .best_fit(bytes, Some(node))
+                .map_err(|_| FabricError::NoDestination)?;
+            self.migrate_tenant(tenant, dest)?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
+    /// Best-fit selection over live capacity, optionally excluding one
+    /// node (the one being drained).
+    fn best_fit(&mut self, bytes: u64, exclude: Option<NodeId>) -> FabricResult<NodeId> {
+        let mut best: Option<(u64, NodeId)> = None; // (slack, node)
+        let mut best_available = 0u64;
+        let candidates: Vec<(NodeId, SocketAddr)> = self
+            .nodes
+            .iter()
+            .filter(|(id, _)| Some(**id) != exclude)
+            .map(|(id, n)| (*id, n.addr))
+            .collect();
+        for (id, addr) in candidates {
+            let free = self.connect(addr)?.node_info()?.uncommitted_vram;
+            best_available = best_available.max(free);
+            if free >= bytes {
+                let slack = free - bytes;
+                // Strict < keeps the BTreeMap iteration order (ascending
+                // NodeId) as the tie-break: deterministic placement.
+                if best.is_none_or(|(s, _)| slack < s) {
+                    best = Some((slack, id));
+                }
+            }
+        }
+        best.map(|(_, id)| id).ok_or(FabricError::NoCapacity {
+            requested: bytes,
+            best_available,
+        })
+    }
+
+    fn connect(&self, addr: SocketAddr) -> FabricResult<VgpuClient> {
+        VgpuClient::connect(addr).map_err(|e| FabricError::Client(ClientError::Io(e)))
+    }
+}
+
+impl Default for Fabric {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Re-exported so fabric users don't need vgpu-core directly for the
+/// common case.
+pub use vgpu_core::vgpu::VgpuProfile as Profile;
