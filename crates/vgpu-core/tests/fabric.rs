@@ -6,7 +6,7 @@ use vgpu_core::prelude::*;
 
 fn node() -> GpuNode {
     GpuNode::new(PhysGpuConfig {
-        name: "sim-256f",
+        name: "sim-256f".to_string(),
         vram_bytes: 256 * FRAME_SIZE,
         slice_cycles: 100,
     })
@@ -14,7 +14,7 @@ fn node() -> GpuNode {
 
 fn profile(name: &'static str, frames: u64, weight: u32) -> VgpuProfile {
     VgpuProfile {
-        name,
+        name: name.to_string(),
         vram_bytes: frames * FRAME_SIZE,
         compute_weight: weight,
         max_channels: 4,
@@ -147,7 +147,7 @@ fn compute_shares_follow_profile_weights() {
             heavy,
             ch_h,
             Command::KernelLaunch {
-                name: "h",
+                name: "h".to_string(),
                 cost: 100,
             },
         )
@@ -156,7 +156,7 @@ fn compute_shares_follow_profile_weights() {
             light,
             ch_l,
             Command::KernelLaunch {
-                name: "l",
+                name: "l".to_string(),
                 cost: 100,
             },
         )
@@ -231,7 +231,7 @@ fn suspend_freezes_execution_and_resume_continues() {
             t,
             ch,
             Command::KernelLaunch {
-                name: "k",
+                name: "k".to_string(),
                 cost: 1000,
             },
         )

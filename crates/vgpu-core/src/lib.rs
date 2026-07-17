@@ -41,14 +41,14 @@
 //!
 //! // A simulated 16 MiB card that prefers 1000-cycle time slices.
 //! let mut node = GpuNode::new(PhysGpuConfig {
-//!     name: "sim-a",
+//!     name: "sim-a".into(),
 //!     vram_bytes: 256 * FRAME_SIZE,
 //!     slice_cycles: 1000,
 //! });
 //!
 //! // Admit a tenant: 2 MiB of VRAM, weight 1, up to 2 channels.
 //! let tenant = node.create_vgpu(VgpuProfile {
-//!     name: "sim-2m.1x",
+//!     name: "sim-2m.1x".into(),
 //!     vram_bytes: 32 * FRAME_SIZE,
 //!     compute_weight: 1,
 //!     max_channels: 2,
@@ -61,7 +61,7 @@
 //! node.dma_write(tenant, buf, b"hello, device").unwrap();
 //!
 //! let ch = node.create_channel(tenant).unwrap();
-//! node.submit(tenant, ch, Command::KernelLaunch { name: "noop", cost: 500 }).unwrap();
+//! node.submit(tenant, ch, Command::KernelLaunch { name: "noop".into(), cost: 500 }).unwrap();
 //! node.submit(tenant, ch, Command::FenceSignal { value: 1 }).unwrap();
 //!
 //! node.tick(10_000);                                   // give the GPU time

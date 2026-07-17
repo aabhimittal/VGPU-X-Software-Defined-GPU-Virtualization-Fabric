@@ -15,12 +15,12 @@ repository is implemented here, explained here, and tested here.
 use vgpu_core::prelude::*;
 
 let mut node = GpuNode::new(PhysGpuConfig {
-    name: "sim-a", vram_bytes: 256 * FRAME_SIZE, slice_cycles: 1000,
+    name: "sim-a".into(), vram_bytes: 256 * FRAME_SIZE, slice_cycles: 1000,
 });
 
 // Admit a tenant under a fixed resource contract (a "profile").
 let tenant = node.create_vgpu(VgpuProfile {
-    name: "sim-2m.1x", vram_bytes: 32 * FRAME_SIZE,
+    name: "sim-2m.1x".into(), vram_bytes: 32 * FRAME_SIZE,
     compute_weight: 1, max_channels: 2, ring_slots: 64,
 })?;
 node.start_vgpu(tenant)?;
@@ -29,10 +29,25 @@ node.start_vgpu(tenant)?;
 let buf = node.alloc_memory(tenant, 4096)?;
 node.dma_write(tenant, buf, b"hello, device")?;
 let ch = node.create_channel(tenant)?;
-node.submit(tenant, ch, Command::KernelLaunch { name: "noop", cost: 500 })?;
+node.submit(tenant, ch, Command::KernelLaunch { name: "noop".into(), cost: 500 })?;
 node.submit(tenant, ch, Command::FenceSignal { value: 1 })?;
 node.tick(10_000);
 assert_eq!(node.fence_value(tenant, ch)?, 1);
+```
+
+The same session, as a *service* — `vgpud` serves the device model over
+TCP and `VgpuClient` is the typed client (milestone 1):
+
+```
+$ vgpud --listen 127.0.0.1:7677 --vram-mib 1024
+vgpud listening on 127.0.0.1:7677
+```
+```rust
+let mut c = VgpuClient::connect("127.0.0.1:7677")?;
+let tenant = c.create_vgpu(profile)?;          // same operations,
+c.start_vgpu(tenant)?;                          // same errors, same
+let buf = c.alloc_memory(tenant, 4096)?;        // isolation — through
+c.dma_write(tenant, buf, b"hello, device")?;    // a socket
 ```
 
 ## Why this project exists
@@ -66,11 +81,12 @@ VGPU-X fixes that by building the whole stack where you can watch it run:
 | 3 | [docs/03-architecture.md](docs/03-architecture.md) | VGPU-X's layers, the two isolation invariants, and the milestone roadmap |
 | 4 | [docs/04-walkthrough-memory.md](docs/04-walkthrough-memory.md) | Line-by-line: buddy allocator, page tables, translation, scrubbing |
 | 5 | [docs/05-walkthrough-execution.md](docs/05-walkthrough-execution.md) | Line-by-line: rings, the engine, virtual-runtime scheduling, the tick loop |
+| 6 | [docs/06-walkthrough-daemon.md](docs/06-walkthrough-daemon.md) | Line-by-line: the wire format, the single-owner device thread, where the wall clock lives |
 
 ## Repository map
 
 ```
-crates/vgpu-core/          the device model (this milestone)
+crates/vgpu-core/          the device model (M0)
   src/types.rs             newtype address/ID discipline + the error taxonomy
   src/vram.rs              buddy allocator + sparse, scrubbed backing store
   src/gmmu.rs              per-vGPU two-level page tables (the isolation boundary)
@@ -80,14 +96,23 @@ crates/vgpu-core/          the device model (this milestone)
   src/engine.rs            translate-then-touch command execution
   src/node.rs              the mediator: admission, DMA, the tick loop
   tests/fabric.rs          multi-tenant isolation & fairness scenarios
+crates/vgpu-proto/         the wire protocol (M1)
+  src/wire.rs              total codecs + length-prefixed framing (hostile-input safe)
+  src/msg.rs               Request/Response vocabulary; lossless VgpuError codec
+  src/client.rs            VgpuClient, the blocking typed client
+crates/vgpud/              the node daemon (M1)
+  src/lib.rs               single-owner device thread + thread-per-connection server
+  src/main.rs              the vgpud binary
+  tests/daemon.rs          end-to-end over real TCP: isolation, errors, concurrency
 docs/                      the book
 ```
 
 ## Running it
 
 ```
-cargo test          # 43 tests: unit, integration, doctest
-cargo doc --open    # the API reference is written as part of the text
+cargo test                    # 60 tests: unit, integration, doctest
+cargo run -p vgpud -- --help  # run a node daemon
+cargo doc --open              # the API reference is written as part of the text
 ```
 
 No GPU required — that is the point of a device model. The simulation is
@@ -98,8 +123,8 @@ values, including exact fair-share cycle counts.
 
 | Milestone | Contents | Status |
 |-----------|----------|--------|
-| **M0 — Device model** (this) | Memory virtualization, command execution, fair scheduling, isolation | ✅ |
-| M1 — Node daemon | `vgpud`: the device model behind a wire protocol; concurrency story | ⏳ |
+| **M0 — Device model** | Memory virtualization, command execution, fair scheduling, isolation | ✅ |
+| **M1 — Node daemon** | `vgpud`: the device model behind a wire protocol; concurrency story | ✅ |
 | M2 — Guest shim | `libvgpu`: API interception (the rCUDA/API-remoting layer) + a kernel interpreter | ⏳ |
 | M3 — Live migration | Suspend/copy/resume of a vGPU between nodes; dirty-page tracking | ⏳ |
 | M4 — The fabric | Multi-node control plane: placement, profiles-as-Tetris, telemetry | ⏳ |

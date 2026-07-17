@@ -1,0 +1,14 @@
+[package]
+name = "vgpud"
+description = "The VGPU-X node daemon: serves the vgpu-core device model over TCP with a single-owner device thread."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vgpu-core = { path = "../vgpu-core" }
+vgpu-proto = { path = "../vgpu-proto" }
+
+[lints]
+workspace = true

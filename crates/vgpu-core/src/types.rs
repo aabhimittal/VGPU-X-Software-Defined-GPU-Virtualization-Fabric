@@ -165,7 +165,7 @@ pub enum VgpuError {
         /// The offending guest virtual address.
         addr: GpuVirtAddr,
         /// Human-readable constraint that was violated.
-        why: &'static str,
+        why: String,
     },
     /// The command ring is full; the guest must wait for the device to
     /// drain it (real drivers spin or sleep on exactly this condition).
@@ -173,9 +173,9 @@ pub enum VgpuError {
     /// Operation is illegal in the vGPU's current lifecycle state.
     InvalidState {
         /// State the vGPU was actually in.
-        actual: &'static str,
+        actual: String,
         /// Operation that was attempted.
-        wanted: &'static str,
+        wanted: String,
     },
     /// Referenced vGPU does not exist on this node.
     NoSuchVgpu(VgpuId),
@@ -184,7 +184,7 @@ pub enum VgpuError {
     /// The physical GPU cannot host another vGPU of this profile.
     ProfileUnsatisfiable {
         /// Why placement failed.
-        why: &'static str,
+        why: String,
     },
     /// The channel previously faulted and was killed; it accepts no more
     /// work until torn down (mirrors real channel-error semantics, where

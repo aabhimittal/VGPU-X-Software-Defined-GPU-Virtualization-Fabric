@@ -5,3 +5,18 @@ version = 4
 [[package]]
 name = "vgpu-core"
 version = "0.1.0"
+
+[[package]]
+name = "vgpu-proto"
+version = "0.1.0"
+dependencies = [
+ "vgpu-core",
+]
+
+[[package]]
+name = "vgpud"
+version = "0.1.0"
+dependencies = [
+ "vgpu-core",
+ "vgpu-proto",
+]
