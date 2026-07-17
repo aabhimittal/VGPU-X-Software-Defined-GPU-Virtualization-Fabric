@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/vgpu-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/aabhimittal/VGPU-X-Software-Defined-GPU-Virtualization-Fabric"
+
+# The core is deliberately dependency-free: every data structure (buddy
+# allocator, page tables, ring buffers, fair scheduler) is implemented from
+# first principles so the repository doubles as a systems-programming text.
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[profile.release]
+lto = true

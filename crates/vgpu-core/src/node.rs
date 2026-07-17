@@ -1,0 +1,439 @@
+//! The GPU node: one physical GPU, many vGPUs, one mediation loop.
+//!
+//! `GpuNode` is the piece that corresponds to the *mediator* in mediated
+//! passthrough (the `nvidia-vgpu-mgr` process / GVT-g's kernel module):
+//! it owns every physical resource (the allocator, the backing store, the
+//! scheduler) and exposes only vGPU-scoped operations. All guest-facing
+//! entry points take a `VgpuId`, and everything they do is confined to
+//! that vGPU's address space and budgets.
+//!
+//! `tick()` is the heart: the time-slicing loop that multiplexes one
+//! physical command front-end across tenants. Everything else is plumbing
+//! around admission control and the host-DMA path.
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::cmd::{ChannelState, Command};
+use crate::engine::execute;
+use crate::sched::Scheduler;
+use crate::types::{AccessKind, ChannelId, Cycles, GpuVirtAddr, Result, VgpuError, VgpuId};
+use crate::vgpu::{Vgpu, VgpuProfile, VgpuState};
+use crate::vram::{FrameStore, VramAllocator};
+
+/// Static description of the physical GPU this node manages.
+#[derive(Debug, Clone)]
+pub struct PhysGpuConfig {
+    /// Card name, for logs and the fabric inventory.
+    pub name: &'static str,
+    /// Total VRAM in bytes (frame multiple).
+    pub vram_bytes: u64,
+    /// Preferred time-slice length in cycles. Shorter slices = lower
+    /// latency between tenants, more scheduling overhead; NVIDIA vGPU
+    /// exposes exactly this dial (0.5-30 ms). Slices are a *target*:
+    /// commands are not preempted mid-execution, so a slice may overrun
+    /// by up to one command's cost (the overrun is charged, so vruntime
+    /// self-corrects — see `tick`).
+    pub slice_cycles: Cycles,
+}
+
+/// What one `tick` did — returned to the caller (and, later, shipped to
+/// the fabric control plane as telemetry).
+#[derive(Debug, Default)]
+pub struct TickReport {
+    /// Real cycles consumed this tick.
+    pub cycles: Cycles,
+    /// Commands executed to completion.
+    pub commands: u64,
+    /// Channels killed by faults this tick.
+    pub faults: Vec<FaultRecord>,
+}
+
+/// One channel-killing fault.
+#[derive(Debug)]
+pub struct FaultRecord {
+    /// Offending vGPU.
+    pub vgpu: VgpuId,
+    /// Channel that was killed.
+    pub channel: ChannelId,
+    /// The fault itself.
+    pub error: VgpuError,
+}
+
+/// One physical GPU and its tenants.
+pub struct GpuNode {
+    config: PhysGpuConfig,
+    vram: VramAllocator,
+    store: FrameStore,
+    vgpus: BTreeMap<VgpuId, Vgpu>,
+    sched: Scheduler,
+    /// Per-vGPU round-robin cursor over its channels, so one busy channel
+    /// cannot starve its siblings within the vGPU's own time slice.
+    rr_cursor: HashMap<VgpuId, usize>,
+    next_id: u32,
+    /// VRAM promised to live vGPUs via their profiles. Admission control
+    /// compares against capacity so profiles can never oversubscribe —
+    /// the foundation models *guaranteed* VRAM, not ballooning.
+    committed_vram: u64,
+    clock: Cycles,
+}
+
+impl GpuNode {
+    /// Bring up a node for the given card.
+    pub fn new(config: PhysGpuConfig) -> Self {
+        let vram = VramAllocator::new(config.vram_bytes);
+        Self {
+            config,
+            vram,
+            store: FrameStore::new(),
+            vgpus: BTreeMap::new(),
+            sched: Scheduler::new(),
+            rr_cursor: HashMap::new(),
+            next_id: 0,
+            committed_vram: 0,
+            clock: 0,
+        }
+    }
+
+    /// Logical time elapsed on this node.
+    pub fn clock(&self) -> Cycles {
+        self.clock
+    }
+
+    /// Real cycles a vGPU has consumed (scheduler account).
+    pub fn consumed(&self, id: VgpuId) -> Cycles {
+        self.sched.consumed(id)
+    }
+
+    /// VRAM bytes not yet promised to any profile.
+    pub fn uncommitted_vram(&self) -> u64 {
+        self.config.vram_bytes - self.committed_vram
+    }
+
+    // -- lifecycle ----------------------------------------------------------
+
+    /// Admit a new vGPU under `profile`.
+    ///
+    /// Admission checks the *profile* budget against *uncommitted*
+    /// capacity — not current free frames — because the contract is that
+    /// an admitted vGPU can always allocate up to its budget. (Buddy
+    /// fragmentation can still fail a specific large allocation; the
+    /// budget guarantees frames exist, not that any given contiguity
+    /// exists. See `docs/04-walkthrough-memory.md`.)
+    pub fn create_vgpu(&mut self, profile: VgpuProfile) -> Result<VgpuId> {
+        profile.validate()?;
+        if self.committed_vram + profile.vram_bytes > self.config.vram_bytes {
+            return Err(VgpuError::ProfileUnsatisfiable {
+                why: "insufficient uncommitted VRAM on this node",
+            });
+        }
+        let id = VgpuId(self.next_id);
+        self.next_id += 1; // never reused: stale IDs must not alias new tenants
+        let weight = profile.compute_weight;
+        self.committed_vram += profile.vram_bytes;
+        self.vgpus.insert(id, Vgpu::new(id, profile)?);
+        self.sched.register(id, weight);
+        self.rr_cursor.insert(id, 0);
+        Ok(id)
+    }
+
+    /// Tear down a vGPU: all VRAM scrubbed and returned, scheduler account
+    /// closed, profile commitment released.
+    pub fn destroy_vgpu(&mut self, id: VgpuId) -> Result<()> {
+        let vgpu = self.vgpus.get_mut(&id).ok_or(VgpuError::NoSuchVgpu(id))?;
+        vgpu.destroy(&mut self.vram, &mut self.store);
+        self.committed_vram -= vgpu.profile.vram_bytes;
+        self.sched.unregister(id);
+        self.rr_cursor.remove(&id);
+        self.vgpus.remove(&id);
+        Ok(())
+    }
+
+    fn vgpu_mut(&mut self, id: VgpuId) -> Result<&mut Vgpu> {
+        self.vgpus.get_mut(&id).ok_or(VgpuError::NoSuchVgpu(id))
+    }
+
+    fn vgpu(&self, id: VgpuId) -> Result<&Vgpu> {
+        self.vgpus.get(&id).ok_or(VgpuError::NoSuchVgpu(id))
+    }
+
+    /// Start a created vGPU.
+    pub fn start_vgpu(&mut self, id: VgpuId) -> Result<()> {
+        self.vgpu_mut(id)?.start()
+    }
+
+    /// Suspend a running vGPU (stops scheduling and submissions).
+    pub fn suspend_vgpu(&mut self, id: VgpuId) -> Result<()> {
+        self.vgpu_mut(id)?.suspend()
+    }
+
+    /// Resume a suspended vGPU.
+    pub fn resume_vgpu(&mut self, id: VgpuId) -> Result<()> {
+        self.vgpu_mut(id)?.resume()
+    }
+
+    /// Lifecycle state of a vGPU.
+    pub fn vgpu_state(&self, id: VgpuId) -> Result<VgpuState> {
+        Ok(self.vgpu(id)?.state())
+    }
+
+    // -- guest-facing operations (each confined to one vGPU) ----------------
+
+    /// Allocate device memory for `id`; returns a guest VA.
+    pub fn alloc_memory(&mut self, id: VgpuId, bytes: u64) -> Result<GpuVirtAddr> {
+        let Self { vgpus, vram, .. } = self;
+        vgpus
+            .get_mut(&id)
+            .ok_or(VgpuError::NoSuchVgpu(id))?
+            .alloc_memory(vram, bytes)
+    }
+
+    /// Free a device allocation by its base VA.
+    pub fn free_memory(&mut self, id: VgpuId, base: GpuVirtAddr) -> Result<()> {
+        let Self {
+            vgpus, vram, store, ..
+        } = self;
+        vgpus
+            .get_mut(&id)
+            .ok_or(VgpuError::NoSuchVgpu(id))?
+            .free_memory(vram, store, base)
+    }
+
+    /// Create a command channel on `id`.
+    pub fn create_channel(&mut self, id: VgpuId) -> Result<ChannelId> {
+        self.vgpu_mut(id)?.create_channel()
+    }
+
+    /// Submit one command to `id`'s channel `ch` (the doorbell write).
+    pub fn submit(&mut self, id: VgpuId, ch: ChannelId, cmd: Command) -> Result<()> {
+        self.vgpu_mut(id)?.submit(ch, cmd)
+    }
+
+    /// Last signaled fence value on a channel.
+    pub fn fence_value(&self, id: VgpuId, ch: ChannelId) -> Result<u64> {
+        self.vgpu(id)?.fence_value(ch)
+    }
+
+    /// Host→device DMA: write host bytes into a vGPU's memory at `dst`.
+    ///
+    /// This is the model's `cudaMemcpyHostToDevice`. It goes through the
+    /// vGPU's page tables like everything else — the host path gets no
+    /// physical back door, which is exactly how an IOMMU-protected DMA
+    /// engine behaves.
+    pub fn dma_write(&mut self, id: VgpuId, dst: GpuVirtAddr, data: &[u8]) -> Result<()> {
+        let Self { vgpus, store, .. } = self;
+        let vgpu = vgpus.get(&id).ok_or(VgpuError::NoSuchVgpu(id))?;
+        let segs = vgpu
+            .aspace
+            .translate_range(dst, data.len() as u64, AccessKind::Write)?;
+        let mut cursor = 0usize;
+        for (pa, len) in segs {
+            store.write(pa, &data[cursor..cursor + len as usize]);
+            cursor += len as usize;
+        }
+        Ok(())
+    }
+
+    /// Device→host DMA: read a vGPU's memory at `src` into a host buffer.
+    pub fn dma_read(&self, id: VgpuId, src: GpuVirtAddr, buf: &mut [u8]) -> Result<()> {
+        let vgpu = self.vgpu(id)?;
+        let segs = vgpu
+            .aspace
+            .translate_range(src, buf.len() as u64, AccessKind::Read)?;
+        let mut cursor = 0usize;
+        for (pa, len) in segs {
+            self.store.read(pa, &mut buf[cursor..cursor + len as usize]);
+            cursor += len as usize;
+        }
+        Ok(())
+    }
+
+    // -- the mediation loop --------------------------------------------------
+
+    /// Run the GPU for up to `budget` cycles, time-slicing across runnable
+    /// vGPUs. Returns what happened.
+    ///
+    /// Loop shape, per iteration:
+    /// 1. refresh runnability (rings may have drained last slice),
+    /// 2. `pick()` the minimum-vruntime runnable vGPU,
+    /// 3. run its commands — round-robin across its channels — until the
+    ///    slice target is met or it runs dry,
+    /// 4. charge the *actual* cycles used (including any overrun from a
+    ///    non-preemptible final command) so vruntime self-corrects: a
+    ///    tenant that overran gets picked correspondingly later next time.
+    ///
+    /// Faults kill the offending channel and are reported; they consume
+    /// the faulting command's cost (the hardware analogue: a faulted
+    /// context still occupied the engine until the fault was recognized).
+    pub fn tick(&mut self, budget: Cycles) -> TickReport {
+        let mut report = TickReport::default();
+
+        while report.cycles < budget {
+            // (1) Runnability can change every slice; recompute honestly.
+            for (id, vgpu) in &self.vgpus {
+                self.sched.set_runnable(*id, vgpu.has_pending_work());
+            }
+            // (2) Whom does fairness owe the next slice?
+            let Some(id) = self.sched.pick() else { break };
+
+            // (3) Drain up to one slice from this vGPU.
+            let slice_target = self.config.slice_cycles.min(budget - report.cycles);
+            let mut slice_used: Cycles = 0;
+            while slice_used < slice_target {
+                let Some((ch, cmd)) = self.pop_round_robin(id) else {
+                    break;
+                };
+                let vgpu = self.vgpus.get_mut(&id).expect("picked ids exist");
+                match execute(&cmd, &vgpu.aspace, &mut self.store) {
+                    Ok(cost) => {
+                        if let Command::FenceSignal { value } = cmd {
+                            // Fences complete in submission order because
+                            // this loop is the only executor and it is
+                            // strictly in-order per channel.
+                            vgpu.channels[ch.0 as usize].completed_fence = value;
+                        }
+                        slice_used += cost;
+                        report.commands += 1;
+                    }
+                    Err(error) => {
+                        vgpu.channels[ch.0 as usize].kill(error.clone());
+                        slice_used += cmd.cost();
+                        report.faults.push(FaultRecord {
+                            vgpu: id,
+                            channel: ch,
+                            error,
+                        });
+                    }
+                }
+            }
+
+            if slice_used == 0 {
+                // Defensive: a vGPU picked with no poppable work (should
+                // be unreachable given the runnability refresh) must not
+                // spin the loop forever.
+                self.sched.set_runnable(id, false);
+                continue;
+            }
+            // (4) Charge reality, not the target.
+            self.sched.charge(id, slice_used);
+            report.cycles += slice_used;
+        }
+
+        self.clock += report.cycles;
+        report
+    }
+
+    /// Pop the next command from `id`'s channels, rotating the cursor so
+    /// channels within a vGPU share its slice round-robin. Skips faulted
+    /// channels (they are dead, and `kill` already drained them).
+    fn pop_round_robin(&mut self, id: VgpuId) -> Option<(ChannelId, Command)> {
+        let vgpu = self.vgpus.get_mut(&id)?;
+        let n = vgpu.channels.len();
+        if n == 0 {
+            return None;
+        }
+        let cursor = self.rr_cursor.entry(id).or_insert(0);
+        for i in 0..n {
+            let idx = (*cursor + i) % n;
+            let channel = &mut vgpu.channels[idx];
+            if channel.state != ChannelState::Active {
+                continue;
+            }
+            if let Some(cmd) = channel.ring.pop() {
+                // Advance past the channel we just served.
+                *cursor = (idx + 1) % n;
+                return Some((ChannelId(idx as u32), cmd));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::FRAME_SIZE;
+
+    fn small_node() -> GpuNode {
+        GpuNode::new(PhysGpuConfig {
+            name: "sim-64f",
+            vram_bytes: 64 * FRAME_SIZE,
+            slice_cycles: 100,
+        })
+    }
+
+    fn profile(weight: u32, frames: u64) -> VgpuProfile {
+        VgpuProfile {
+            name: "t",
+            vram_bytes: frames * FRAME_SIZE,
+            compute_weight: weight,
+            max_channels: 4,
+            ring_slots: 64,
+        }
+    }
+
+    #[test]
+    fn admission_control_refuses_oversubscription() {
+        let mut node = small_node();
+        node.create_vgpu(profile(1, 40)).unwrap();
+        let err = node.create_vgpu(profile(1, 40)).unwrap_err();
+        assert!(matches!(err, VgpuError::ProfileUnsatisfiable { .. }));
+        // 24 frames remain uncommitted; a 24-frame profile fits.
+        node.create_vgpu(profile(1, 24)).unwrap();
+    }
+
+    #[test]
+    fn destroy_releases_commitment() {
+        let mut node = small_node();
+        let a = node.create_vgpu(profile(1, 64)).unwrap();
+        assert_eq!(node.uncommitted_vram(), 0);
+        node.destroy_vgpu(a).unwrap();
+        assert_eq!(node.uncommitted_vram(), 64 * FRAME_SIZE);
+    }
+
+    #[test]
+    fn tick_with_no_work_is_a_clean_noop() {
+        let mut node = small_node();
+        let a = node.create_vgpu(profile(1, 8)).unwrap();
+        node.start_vgpu(a).unwrap();
+        let r = node.tick(10_000);
+        assert_eq!(r.cycles, 0);
+        assert_eq!(r.commands, 0);
+        assert_eq!(node.clock(), 0);
+    }
+
+    #[test]
+    fn fences_signal_in_order() {
+        let mut node = small_node();
+        let a = node.create_vgpu(profile(1, 8)).unwrap();
+        node.start_vgpu(a).unwrap();
+        let ch = node.create_channel(a).unwrap();
+        let buf = node.alloc_memory(a, FRAME_SIZE).unwrap();
+        node.submit(
+            a,
+            ch,
+            Command::MemFill {
+                dst: buf,
+                len: 256,
+                value: 1,
+            },
+        )
+        .unwrap();
+        node.submit(a, ch, Command::FenceSignal { value: 1 })
+            .unwrap();
+        node.submit(
+            a,
+            ch,
+            Command::KernelLaunch {
+                name: "k",
+                cost: 50,
+            },
+        )
+        .unwrap();
+        node.submit(a, ch, Command::FenceSignal { value: 2 })
+            .unwrap();
+
+        assert_eq!(node.fence_value(a, ch).unwrap(), 0);
+        node.tick(1_000_000);
+        assert_eq!(node.fence_value(a, ch).unwrap(), 2);
+    }
+}
