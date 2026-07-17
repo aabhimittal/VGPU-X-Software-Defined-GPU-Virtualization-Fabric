@@ -61,7 +61,12 @@
 //! node.dma_write(tenant, buf, b"hello, device").unwrap();
 //!
 //! let ch = node.create_channel(tenant).unwrap();
-//! node.submit(tenant, ch, Command::KernelLaunch { name: "noop".into(), cost: 500 }).unwrap();
+//! node.submit(tenant, ch, Command::KernelLaunch {
+//!     name: "noop".into(),
+//!     threads: 1,
+//!     args: vec![],
+//!     program: vgpu_core::isa::busy(500), // a real program now — see `isa`
+//! }).unwrap();
 //! node.submit(tenant, ch, Command::FenceSignal { value: 1 }).unwrap();
 //!
 //! node.tick(10_000);                                   // give the GPU time
@@ -75,6 +80,7 @@
 pub mod cmd;
 pub mod engine;
 pub mod gmmu;
+pub mod isa;
 pub mod node;
 pub mod sched;
 pub mod types;

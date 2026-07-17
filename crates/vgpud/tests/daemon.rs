@@ -207,7 +207,9 @@ fn auto_tick_drives_the_gpu() {
         ch,
         Command::KernelLaunch {
             name: "bg".into(),
-            cost: 10,
+            threads: 1,
+            args: vec![],
+            program: vgpu_core::isa::busy(10),
         },
     )
     .unwrap();

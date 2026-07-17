@@ -190,6 +190,20 @@ pub enum VgpuError {
     /// work until torn down (mirrors real channel-error semantics, where
     /// the driver "RC recovers" the channel).
     ChannelFaulted(ChannelId),
+    /// A kernel program failed static validation at submit time (bad
+    /// register index, branch out of range, too many arguments). Rejected
+    /// at the doorbell, before the program ever occupies the engine.
+    BadProgram {
+        /// Which validation rule the program broke.
+        why: String,
+    },
+    /// A kernel exceeded the per-launch watchdog instruction budget and
+    /// its channel was killed — the device model's TDR. A guest cannot be
+    /// trusted to terminate its own infinite loop; the device must.
+    KernelTimeout {
+        /// Instructions executed before the watchdog fired.
+        executed: u64,
+    },
 }
 
 /// Whether a faulting access was a read or a write — reported in the fault
@@ -234,6 +248,10 @@ impl fmt::Display for VgpuError {
             Self::NoSuchChannel(id) => write!(f, "no such channel: {id}"),
             Self::ProfileUnsatisfiable { why } => write!(f, "profile unsatisfiable: {why}"),
             Self::ChannelFaulted(id) => write!(f, "channel {id} is faulted"),
+            Self::BadProgram { why } => write!(f, "bad kernel program: {why}"),
+            Self::KernelTimeout { executed } => {
+                write!(f, "kernel watchdog fired after {executed} instructions")
+            }
         }
     }
 }

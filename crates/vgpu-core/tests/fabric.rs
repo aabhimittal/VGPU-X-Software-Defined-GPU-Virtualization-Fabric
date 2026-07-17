@@ -2,6 +2,7 @@
 //! to make true. Each test is a security or fairness *claim* stated as
 //! executable code; `docs/03-architecture.md` cites them by name.
 
+use vgpu_core::isa::busy;
 use vgpu_core::prelude::*;
 
 fn node() -> GpuNode {
@@ -148,7 +149,9 @@ fn compute_shares_follow_profile_weights() {
             ch_h,
             Command::KernelLaunch {
                 name: "h".to_string(),
-                cost: 100,
+                threads: 1,
+                args: vec![],
+                program: busy(100),
             },
         )
         .unwrap();
@@ -157,7 +160,9 @@ fn compute_shares_follow_profile_weights() {
             ch_l,
             Command::KernelLaunch {
                 name: "l".to_string(),
-                cost: 100,
+                threads: 1,
+                args: vec![],
+                program: busy(100),
             },
         )
         .unwrap();
@@ -232,7 +237,9 @@ fn suspend_freezes_execution_and_resume_continues() {
             ch,
             Command::KernelLaunch {
                 name: "k".to_string(),
-                cost: 1000,
+                threads: 1,
+                args: vec![],
+                program: busy(1000),
             },
         )
         .unwrap();

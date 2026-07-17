@@ -19,7 +19,12 @@ use std::io::{self, Read, Write};
 
 /// Protocol version, first byte of every payload. Bump on any layout
 /// change; peers refuse mismatches loudly rather than misparse silently.
-pub const VERSION: u8 = 1;
+///
+/// History: v1 = milestone 1 (opaque-cost kernels); v2 = milestone 2
+/// (`KernelLaunch` carries threads/args/program, two new error variants).
+/// The command layout changed shape, so v1 peers must be refused — this
+/// bump is the versioning policy doing its job, not an inconvenience.
+pub const VERSION: u8 = 2;
 
 /// Upper bound on a frame body. Guards the daemon against a malicious or
 /// broken client sending a 4 GiB length prefix and OOMing the host — the

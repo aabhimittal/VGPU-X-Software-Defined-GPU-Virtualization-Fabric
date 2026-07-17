@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/vgpu-core", "crates/vgpu-proto", "crates/vgpud"]
+members = [
+    "crates/vgpu-core",
+    "crates/vgpu-proto",
+    "crates/vgpu-shim",
+    "crates/vgpud",
+]
 
 [workspace.package]
 version = "0.1.0"

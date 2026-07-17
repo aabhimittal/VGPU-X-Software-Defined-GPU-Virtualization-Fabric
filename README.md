@@ -29,7 +29,10 @@ node.start_vgpu(tenant)?;
 let buf = node.alloc_memory(tenant, 4096)?;
 node.dma_write(tenant, buf, b"hello, device")?;
 let ch = node.create_channel(tenant)?;
-node.submit(tenant, ch, Command::KernelLaunch { name: "noop".into(), cost: 500 })?;
+node.submit(tenant, ch, Command::KernelLaunch {
+    name: "noop".into(), threads: 1, args: vec![],
+    program: vgpu_core::isa::busy(500),   // kernels are real programs (M2)
+})?;
 node.submit(tenant, ch, Command::FenceSignal { value: 1 })?;
 node.tick(10_000);
 assert_eq!(node.fence_value(tenant, ch)?, 1);
@@ -82,6 +85,7 @@ VGPU-X fixes that by building the whole stack where you can watch it run:
 | 4 | [docs/04-walkthrough-memory.md](docs/04-walkthrough-memory.md) | Line-by-line: buddy allocator, page tables, translation, scrubbing |
 | 5 | [docs/05-walkthrough-execution.md](docs/05-walkthrough-execution.md) | Line-by-line: rings, the engine, virtual-runtime scheduling, the tick loop |
 | 6 | [docs/06-walkthrough-daemon.md](docs/06-walkthrough-daemon.md) | Line-by-line: the wire format, the single-owner device thread, where the wall clock lives |
+| 7 | [docs/07-walkthrough-shim.md](docs/07-walkthrough-shim.md) | Line-by-line: the kernel ISA and interpreter, the watchdog (TDR), and the CUDA-shaped guest shim |
 
 ## Repository map
 
@@ -91,6 +95,7 @@ crates/vgpu-core/          the device model (M0)
   src/vram.rs              buddy allocator + sparse, scrubbed backing store
   src/gmmu.rs              per-vGPU two-level page tables (the isolation boundary)
   src/cmd.rs               commands, rings, doorbell semantics, fences, channels
+  src/isa.rs               the kernel ISA: 9 instructions, static validation (M2)
   src/vgpu.rs              profiles, budgets, lifecycle state machine
   src/sched.rs             weighted virtual-runtime fair scheduler
   src/engine.rs            translate-then-touch command execution
@@ -100,6 +105,9 @@ crates/vgpu-proto/         the wire protocol (M1)
   src/wire.rs              total codecs + length-prefixed framing (hostile-input safe)
   src/msg.rs               Request/Response vocabulary; lossless VgpuError codec
   src/client.rs            VgpuClient, the blocking typed client
+crates/vgpu-shim/          the guest runtime (M2)
+  src/lib.rs               CUDA-shaped API: malloc/memcpy/streams/launch/sync
+  tests/shim.rs            the CUDA-tutorial flow, faults, watchdog — over TCP
 crates/vgpud/              the node daemon (M1)
   src/lib.rs               single-owner device thread + thread-per-connection server
   src/main.rs              the vgpud binary
@@ -110,7 +118,7 @@ docs/                      the book
 ## Running it
 
 ```
-cargo test                    # 60 tests: unit, integration, doctest
+cargo test                    # 76 tests: unit, integration, doctest
 cargo run -p vgpud -- --help  # run a node daemon
 cargo doc --open              # the API reference is written as part of the text
 ```
@@ -125,7 +133,7 @@ values, including exact fair-share cycle counts.
 |-----------|----------|--------|
 | **M0 — Device model** | Memory virtualization, command execution, fair scheduling, isolation | ✅ |
 | **M1 — Node daemon** | `vgpud`: the device model behind a wire protocol; concurrency story | ✅ |
-| M2 — Guest shim | `libvgpu`: API interception (the rCUDA/API-remoting layer) + a kernel interpreter | ⏳ |
+| **M2 — Guest shim** | `vgpu-shim`: the CUDA-shaped remoting API + a real kernel ISA, interpreter, and watchdog | ✅ |
 | M3 — Live migration | Suspend/copy/resume of a vGPU between nodes; dirty-page tracking | ⏳ |
 | M4 — The fabric | Multi-node control plane: placement, profiles-as-Tetris, telemetry | ⏳ |
 

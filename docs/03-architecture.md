@@ -143,8 +143,8 @@ assumption:
 
 | Simplification | Where the fix lands |
 |---|---|
-| Single-threaded; `Ring` uses plain integers, not atomics | M1 wraps the model in a daemon with a real concurrency story; the SPSC ring grows atomics with documented ordering |
-| Kernels are opaque cycle costs | M2 adds a tiny kernel interpreter so launches touch guest memory through the same GMMU |
+| ~~Single-threaded~~ | Landed in M1: `vgpud`'s single-owner device thread serializes all access (the ring stays lock-free by design — see docs/06) |
+| ~~Kernels are opaque cycle costs~~ | Landed in M2: `isa.rs` + the interpreter in `engine.rs` route every kernel load/store through the GMMU, with a watchdog for runaways |
 | No TLB model → no shootdown protocol | M3 needs unmap-during-migration; the TLB model arrives with the thing that makes it observable |
 | Fences poll; no interrupts | M1's wire protocol adds completion notification |
 | One execution front-end (no engine parallelism) | Post-M2, copy/compute engine overlap becomes a scheduler dimension |
