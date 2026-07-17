@@ -7,6 +7,15 @@ name = "vgpu-core"
 version = "0.1.0"
 
 [[package]]
+name = "vgpu-fabric"
+version = "0.1.0"
+dependencies = [
+ "vgpu-core",
+ "vgpu-proto",
+ "vgpud",
+]
+
+[[package]]
 name = "vgpu-proto"
 version = "0.1.0"
 dependencies = [

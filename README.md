@@ -87,6 +87,7 @@ VGPU-X fixes that by building the whole stack where you can watch it run:
 | 6 | [docs/06-walkthrough-daemon.md](docs/06-walkthrough-daemon.md) | Line-by-line: the wire format, the single-owner device thread, where the wall clock lives |
 | 7 | [docs/07-walkthrough-shim.md](docs/07-walkthrough-shim.md) | Line-by-line: the kernel ISA and interpreter, the watchdog (TDR), and the CUDA-shaped guest shim |
 | 8 | [docs/08-walkthrough-migration.md](docs/08-walkthrough-migration.md) | Line-by-line: dirty bits, heap-shape replay, and the pre-copy live migration driver |
+| 9 | [docs/09-walkthrough-fabric.md](docs/09-walkthrough-fabric.md) | Line-by-line: control vs data plane, best-fit placement, evacuation, and the closing argument |
 
 ## Repository map
 
@@ -107,6 +108,9 @@ crates/vgpu-proto/         the wire protocol (M1)
   src/msg.rs               Request/Response vocabulary; lossless VgpuError codec
   src/client.rs            VgpuClient, the blocking typed client
   src/migrate.rs           the pre-copy live migration driver (M3)
+crates/vgpu-fabric/        the control plane (M4)
+  src/lib.rs               best-fit placement, inventory, migration, evacuation
+  tests/fabric.rs          a three-node fleet: exact placement, drains, registry
 crates/vgpu-shim/          the guest runtime (M2)
   src/lib.rs               CUDA-shaped API: malloc/memcpy/streams/launch/sync
   tests/shim.rs            the CUDA-tutorial flow, faults, watchdog — over TCP
@@ -121,7 +125,7 @@ docs/                      the book
 ## Running it
 
 ```
-cargo test                    # 81 tests: unit, integration, doctest
+cargo test                    # 85 tests: unit, integration, doctest
 cargo run -p vgpud -- --help  # run a node daemon
 cargo doc --open              # the API reference is written as part of the text
 ```
@@ -138,7 +142,13 @@ values, including exact fair-share cycle counts.
 | **M1 — Node daemon** | `vgpud`: the device model behind a wire protocol; concurrency story | ✅ |
 | **M2 — Guest shim** | `vgpu-shim`: the CUDA-shaped remoting API + a real kernel ISA, interpreter, and watchdog | ✅ |
 | **M3 — Live migration** | Pre-copy migration between nodes: dirty-page tracking, heap-shape replay, channel export | ✅ |
-| M4 — The fabric | Multi-node control plane: placement, profiles-as-Tetris, telemetry | ⏳ |
+| **M4 — The fabric** | `vgpu-fabric`: best-fit placement, live inventory, tenant migration, node drain | ✅ |
+
+The roadmap is complete: guest app → shim → wire → daemon → device model,
+coordinated by a control plane, with live migration between nodes. The
+final chapter ([docs/09](docs/09-walkthrough-fabric.md)) closes with where
+a reader could take it next (TLB shootdowns, engine parallelism, post-copy
+migration, a C-ABI shim, consensus-backed fabric HA).
 
 ## License
 
