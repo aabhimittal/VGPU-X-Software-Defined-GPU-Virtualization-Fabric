@@ -24,7 +24,7 @@ use crate::vram::{FrameStore, VramAllocator};
 #[derive(Debug, Clone)]
 pub struct PhysGpuConfig {
     /// Card name, for logs and the fabric inventory.
-    pub name: &'static str,
+    pub name: String,
     /// Total VRAM in bytes (frame multiple).
     pub vram_bytes: u64,
     /// Preferred time-slice length in cycles. Shorter slices = lower
@@ -99,6 +99,11 @@ impl GpuNode {
         self.clock
     }
 
+    /// The card description this node was brought up with.
+    pub fn config(&self) -> &PhysGpuConfig {
+        &self.config
+    }
+
     /// Real cycles a vGPU has consumed (scheduler account).
     pub fn consumed(&self, id: VgpuId) -> Cycles {
         self.sched.consumed(id)
@@ -123,7 +128,7 @@ impl GpuNode {
         profile.validate()?;
         if self.committed_vram + profile.vram_bytes > self.config.vram_bytes {
             return Err(VgpuError::ProfileUnsatisfiable {
-                why: "insufficient uncommitted VRAM on this node",
+                why: "insufficient uncommitted VRAM on this node".to_string(),
             });
         }
         let id = VgpuId(self.next_id);
@@ -355,7 +360,7 @@ mod tests {
 
     fn small_node() -> GpuNode {
         GpuNode::new(PhysGpuConfig {
-            name: "sim-64f",
+            name: "sim-64f".to_string(),
             vram_bytes: 64 * FRAME_SIZE,
             slice_cycles: 100,
         })
@@ -363,7 +368,7 @@ mod tests {
 
     fn profile(weight: u32, frames: u64) -> VgpuProfile {
         VgpuProfile {
-            name: "t",
+            name: "t".to_string(),
             vram_bytes: frames * FRAME_SIZE,
             compute_weight: weight,
             max_channels: 4,
@@ -424,7 +429,7 @@ mod tests {
             a,
             ch,
             Command::KernelLaunch {
-                name: "k",
+                name: "k".to_string(),
                 cost: 50,
             },
         )

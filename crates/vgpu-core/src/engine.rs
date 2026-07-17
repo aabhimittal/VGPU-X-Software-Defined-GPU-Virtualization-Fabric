@@ -138,7 +138,7 @@ mod tests {
         let mut store = FrameStore::new();
         let c = execute(
             &Command::KernelLaunch {
-                name: "gemm",
+                name: "gemm".to_string(),
                 cost: 1234,
             },
             &aspace,

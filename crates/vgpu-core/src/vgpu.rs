@@ -26,7 +26,7 @@ use crate::vram::{FrameRange, FrameStore, VramAllocator};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VgpuProfile {
     /// Human-readable profile name, e.g. "sim-2g.25c".
-    pub name: &'static str,
+    pub name: String,
     /// Hard VRAM budget in bytes (must be a frame multiple).
     pub vram_bytes: u64,
     /// Scheduler weight: this vGPU's share of compute is
@@ -44,22 +44,22 @@ impl VgpuProfile {
     pub fn validate(&self) -> Result<()> {
         if self.vram_bytes == 0 || !self.vram_bytes.is_multiple_of(FRAME_SIZE) {
             return Err(VgpuError::ProfileUnsatisfiable {
-                why: "vram_bytes must be a positive multiple of FRAME_SIZE",
+                why: "vram_bytes must be a positive multiple of FRAME_SIZE".to_string(),
             });
         }
         if self.vram_bytes > VA_LIMIT {
             return Err(VgpuError::ProfileUnsatisfiable {
-                why: "vram_bytes exceeds the 64 GiB per-vGPU VA space",
+                why: "vram_bytes exceeds the 64 GiB per-vGPU VA space".to_string(),
             });
         }
         if self.compute_weight == 0 {
             return Err(VgpuError::ProfileUnsatisfiable {
-                why: "compute_weight must be > 0",
+                why: "compute_weight must be > 0".to_string(),
             });
         }
         if self.max_channels == 0 || self.ring_slots < 2 {
             return Err(VgpuError::ProfileUnsatisfiable {
-                why: "need at least 1 channel and 2 ring slots",
+                why: "need at least 1 channel and 2 ring slots".to_string(),
             });
         }
         Ok(())
@@ -171,8 +171,8 @@ impl Vgpu {
             Ok(())
         } else {
             Err(VgpuError::InvalidState {
-                actual: self.state.name(),
-                wanted: wanted_op,
+                actual: self.state.name().to_string(),
+                wanted: wanted_op.to_string(),
             })
         }
     }
@@ -218,7 +218,7 @@ impl Vgpu {
         if bytes == 0 {
             return Err(VgpuError::BadAddress {
                 addr: GpuVirtAddr(0),
-                why: "zero-byte allocation",
+                why: "zero-byte allocation".to_string(),
             });
         }
         let pages = bytes.div_ceil(FRAME_SIZE);
@@ -293,7 +293,7 @@ impl Vgpu {
         self.expect_state("create_channel", &[VgpuState::Running, VgpuState::Created])?;
         if self.channels.len() as u32 >= self.profile.max_channels {
             return Err(VgpuError::ProfileUnsatisfiable {
-                why: "channel limit reached",
+                why: "channel limit reached".to_string(),
             });
         }
         let id = ChannelId(self.channels.len() as u32);
@@ -360,7 +360,7 @@ mod tests {
 
     fn profile() -> VgpuProfile {
         VgpuProfile {
-            name: "test-1g",
+            name: "test-1g".to_string(),
             vram_bytes: 16 * FRAME_SIZE,
             compute_weight: 1,
             max_channels: 2,

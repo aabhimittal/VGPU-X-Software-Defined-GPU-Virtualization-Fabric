@@ -1,0 +1,13 @@
+[package]
+name = "vgpu-proto"
+description = "VGPU-X wire protocol: hand-rolled binary framing and codecs for every device-model operation, plus the blocking client."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vgpu-core = { path = "../vgpu-core" }
+
+[lints]
+workspace = true

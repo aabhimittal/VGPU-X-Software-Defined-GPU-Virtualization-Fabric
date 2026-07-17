@@ -55,7 +55,7 @@ pub enum Command {
     /// which is all the *scheduler* ever sees of a kernel anyway.
     KernelLaunch {
         /// Debug name (what a profiler would show).
-        name: &'static str,
+        name: String,
         /// Modeled execution cost in cycles.
         cost: Cycles,
     },

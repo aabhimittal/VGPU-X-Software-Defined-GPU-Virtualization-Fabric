@@ -94,7 +94,7 @@ fn split_va(addr: GpuVirtAddr) -> Result<(usize, usize, u64)> {
     if addr.0 >= VA_LIMIT {
         return Err(VgpuError::BadAddress {
             addr,
-            why: "beyond 36-bit VA space",
+            why: "beyond 36-bit VA space".to_string(),
         });
     }
     let offset = addr.0 & ((1 << OFFSET_BITS) - 1);
@@ -138,7 +138,7 @@ impl AddressSpace {
         if !base.0.is_multiple_of(FRAME_SIZE) {
             return Err(VgpuError::BadAddress {
                 addr: base,
-                why: "map base not page-aligned",
+                why: "map base not page-aligned".to_string(),
             });
         }
 
@@ -147,7 +147,7 @@ impl AddressSpace {
             let va = GpuVirtAddr(base.0.checked_add(i as u64 * FRAME_SIZE).ok_or(
                 VgpuError::BadAddress {
                     addr: base,
-                    why: "VA overflow",
+                    why: "VA overflow".to_string(),
                 },
             )?);
             let (pde, pte, _) = split_va(va)?;
@@ -178,7 +178,7 @@ impl AddressSpace {
         if !base.0.is_multiple_of(FRAME_SIZE) {
             return Err(VgpuError::BadAddress {
                 addr: base,
-                why: "unmap base not page-aligned",
+                why: "unmap base not page-aligned".to_string(),
             });
         }
         // Pass 1: every page must currently be mapped (all-or-nothing).
@@ -247,7 +247,7 @@ impl AddressSpace {
         let mut cur = addr.0;
         let end = cur.checked_add(len).ok_or(VgpuError::BadAddress {
             addr,
-            why: "range overflows u64",
+            why: "range overflows u64".to_string(),
         })?;
         while cur < end {
             let va = GpuVirtAddr(cur);

@@ -126,7 +126,7 @@ impl VramAllocator {
         if frames == 0 {
             return Err(VgpuError::BadAddress {
                 addr: crate::types::GpuVirtAddr(0),
-                why: "zero-length allocation",
+                why: "zero-length allocation".to_string(),
             });
         }
         let order = order_for(frames);
