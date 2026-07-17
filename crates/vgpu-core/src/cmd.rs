@@ -50,14 +50,20 @@ pub enum Command {
         /// Byte count.
         len: u64,
     },
-    /// Launch a compute kernel. The foundation milestone does not execute
-    /// shader code; a launch is modeled as an opaque burn of `cost` cycles,
-    /// which is all the *scheduler* ever sees of a kernel anyway.
+    /// Launch a compute kernel: `threads` copies of `program`, each with
+    /// `r0 = thread index` and `args` preloaded into `r1..`. Programs are
+    /// statically validated at submit (`isa::validate`) and interpreted by
+    /// the engine, with every `Ld`/`St` translated through the submitting
+    /// vGPU's page tables — kernels have no other path to memory.
     KernelLaunch {
         /// Debug name (what a profiler would show).
         name: String,
-        /// Modeled execution cost in cycles.
-        cost: Cycles,
+        /// Number of threads in the (flat) grid.
+        threads: u32,
+        /// Kernel arguments, loaded into `r1..` of every thread.
+        args: Vec<u64>,
+        /// The program, shared by all threads.
+        program: Vec<crate::isa::Instr>,
     },
     /// Write `value` to the channel's fence slot when all prior commands
     /// in this ring have completed. Fences are how the guest learns that
@@ -75,11 +81,22 @@ impl Command {
     /// needs *relative* magnitudes to demonstrate fair sharing, and a
     /// transparent cost model keeps every fairness test explainable by
     /// hand. (1 cycle per 16 bytes ≈ "copies are bandwidth-bound".)
+    ///
+    /// For `KernelLaunch` this is the *straight-line estimate* (per-thread
+    /// instruction costs × threads): exact for branch-free programs, a
+    /// lower bound for loops. The engine reports the real executed cost;
+    /// this estimate exists only for pre-execution accounting (ring
+    /// pricing, fault charging for commands that never ran).
     pub fn cost(&self) -> Cycles {
         match self {
             Command::MemFill { len, .. } => 1 + len / 16,
             Command::MemCopy { len, .. } => 1 + len / 8, // read + write traffic
-            Command::KernelLaunch { cost, .. } => (*cost).max(1),
+            Command::KernelLaunch {
+                threads, program, ..
+            } => {
+                let per_thread: u64 = program.iter().map(crate::isa::Instr::cost).sum();
+                (per_thread.saturating_mul(*threads as u64)).max(1)
+            }
             Command::FenceSignal { .. } => 1,
         }
     }

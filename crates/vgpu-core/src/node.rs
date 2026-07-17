@@ -288,20 +288,24 @@ impl GpuNode {
                     break;
                 };
                 let vgpu = self.vgpus.get_mut(&id).expect("picked ids exist");
-                match execute(&cmd, &vgpu.aspace, &mut self.store) {
-                    Ok(cost) => {
+                let outcome = execute(&cmd, &vgpu.aspace, &mut self.store);
+                // Charge engine occupancy regardless of outcome — a
+                // faulting command still held the engine until the fault
+                // was recognized (kernels: the instructions actually
+                // executed before faulting).
+                slice_used += outcome.cycles.max(1);
+                match outcome.result {
+                    Ok(()) => {
                         if let Command::FenceSignal { value } = cmd {
                             // Fences complete in submission order because
                             // this loop is the only executor and it is
                             // strictly in-order per channel.
                             vgpu.channels[ch.0 as usize].completed_fence = value;
                         }
-                        slice_used += cost;
                         report.commands += 1;
                     }
                     Err(error) => {
                         vgpu.channels[ch.0 as usize].kill(error.clone());
-                        slice_used += cmd.cost();
                         report.faults.push(FaultRecord {
                             vgpu: id,
                             channel: ch,
@@ -430,7 +434,9 @@ mod tests {
             ch,
             Command::KernelLaunch {
                 name: "k".to_string(),
-                cost: 50,
+                threads: 1,
+                args: vec![],
+                program: crate::isa::busy(50),
             },
         )
         .unwrap();

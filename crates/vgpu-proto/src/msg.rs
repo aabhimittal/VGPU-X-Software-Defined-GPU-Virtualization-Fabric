@@ -10,6 +10,7 @@
 //! stable protocol surface: append new ones, never renumber.
 
 use vgpu_core::cmd::Command;
+use vgpu_core::isa::Instr;
 use vgpu_core::node::{FaultRecord, TickReport};
 use vgpu_core::types::{AccessKind, ChannelId, GpuVirtAddr, VgpuError, VgpuId};
 use vgpu_core::vgpu::{VgpuProfile, VgpuState};
@@ -210,16 +211,132 @@ fn enc_command(e: &mut Enc, c: &Command) {
             e.u64(dst.0);
             e.u64(*len);
         }
-        Command::KernelLaunch { name, cost } => {
+        Command::KernelLaunch {
+            name,
+            threads,
+            args,
+            program,
+        } => {
             e.u8(3);
             e.str(name);
-            e.u64(*cost);
+            e.u32(*threads);
+            e.u32(args.len() as u32);
+            for a in args {
+                e.u64(*a);
+            }
+            e.u32(program.len() as u32);
+            for i in program {
+                enc_instr(e, i);
+            }
         }
         Command::FenceSignal { value } => {
             e.u8(4);
             e.u64(*value);
         }
     }
+}
+
+/// Instruction codec. One tag byte per opcode; register operands are the
+/// raw `u8` indices (the *daemon-side* `isa::validate` at submit is the
+/// authority on their validity — the wire only preserves them).
+fn enc_instr(e: &mut Enc, i: &Instr) {
+    match i {
+        Instr::Imm { dst, value } => {
+            e.u8(1);
+            e.u8(*dst);
+            e.u64(*value);
+        }
+        Instr::Mov { dst, src } => {
+            e.u8(2);
+            e.u8(*dst);
+            e.u8(*src);
+        }
+        Instr::Add { dst, a, b } => {
+            e.u8(3);
+            e.u8(*dst);
+            e.u8(*a);
+            e.u8(*b);
+        }
+        Instr::Sub { dst, a, b } => {
+            e.u8(4);
+            e.u8(*dst);
+            e.u8(*a);
+            e.u8(*b);
+        }
+        Instr::Mul { dst, a, b } => {
+            e.u8(5);
+            e.u8(*dst);
+            e.u8(*a);
+            e.u8(*b);
+        }
+        Instr::Ld { dst, addr, offset } => {
+            e.u8(6);
+            e.u8(*dst);
+            e.u8(*addr);
+            e.u64(*offset);
+        }
+        Instr::St { src, addr, offset } => {
+            e.u8(7);
+            e.u8(*src);
+            e.u8(*addr);
+            e.u64(*offset);
+        }
+        Instr::Bnz { cond, target } => {
+            e.u8(8);
+            e.u8(*cond);
+            e.u32(*target as u32);
+        }
+        Instr::Halt => e.u8(9),
+    }
+}
+
+fn dec_instr(d: &mut Dec) -> Result<Instr, WireError> {
+    Ok(match d.u8()? {
+        1 => Instr::Imm {
+            dst: d.u8()?,
+            value: d.u64()?,
+        },
+        2 => Instr::Mov {
+            dst: d.u8()?,
+            src: d.u8()?,
+        },
+        3 => Instr::Add {
+            dst: d.u8()?,
+            a: d.u8()?,
+            b: d.u8()?,
+        },
+        4 => Instr::Sub {
+            dst: d.u8()?,
+            a: d.u8()?,
+            b: d.u8()?,
+        },
+        5 => Instr::Mul {
+            dst: d.u8()?,
+            a: d.u8()?,
+            b: d.u8()?,
+        },
+        6 => Instr::Ld {
+            dst: d.u8()?,
+            addr: d.u8()?,
+            offset: d.u64()?,
+        },
+        7 => Instr::St {
+            src: d.u8()?,
+            addr: d.u8()?,
+            offset: d.u64()?,
+        },
+        8 => Instr::Bnz {
+            cond: d.u8()?,
+            target: d.u32()? as u16,
+        },
+        9 => Instr::Halt,
+        tag => {
+            return Err(WireError::BadTag {
+                context: "Instr",
+                tag,
+            })
+        }
+    })
 }
 
 fn dec_command(d: &mut Dec) -> Result<Command, WireError> {
@@ -234,10 +351,26 @@ fn dec_command(d: &mut Dec) -> Result<Command, WireError> {
             dst: GpuVirtAddr(d.u64()?),
             len: d.u64()?,
         },
-        3 => Command::KernelLaunch {
-            name: d.str()?,
-            cost: d.u64()?,
-        },
+        3 => {
+            let name = d.str()?;
+            let threads = d.u32()?;
+            let n_args = d.u32()?;
+            let mut args = Vec::with_capacity(n_args as usize);
+            for _ in 0..n_args {
+                args.push(d.u64()?);
+            }
+            let n_instr = d.u32()?;
+            let mut program = Vec::with_capacity(n_instr as usize);
+            for _ in 0..n_instr {
+                program.push(dec_instr(d)?);
+            }
+            Command::KernelLaunch {
+                name,
+                threads,
+                args,
+                program,
+            }
+        }
         4 => Command::FenceSignal { value: d.u64()? },
         tag => {
             return Err(WireError::BadTag {
@@ -324,6 +457,14 @@ fn enc_error(e: &mut Enc, err: &VgpuError) {
             e.u8(12);
             e.u32(id.0);
         }
+        VgpuError::BadProgram { why } => {
+            e.u8(13);
+            e.str(why);
+        }
+        VgpuError::KernelTimeout { executed } => {
+            e.u8(14);
+            e.u64(*executed);
+        }
     }
 }
 
@@ -360,6 +501,8 @@ fn dec_error(d: &mut Dec) -> Result<VgpuError, WireError> {
         10 => VgpuError::NoSuchChannel(ChannelId(d.u32()?)),
         11 => VgpuError::ProfileUnsatisfiable { why: d.str()? },
         12 => VgpuError::ChannelFaulted(ChannelId(d.u32()?)),
+        13 => VgpuError::BadProgram { why: d.str()? },
+        14 => VgpuError::KernelTimeout { executed: d.u64()? },
         tag => {
             return Err(WireError::BadTag {
                 context: "VgpuError",
@@ -691,9 +834,30 @@ mod tests {
                 dst: GpuVirtAddr(64),
                 len: 32,
             },
+            // One launch exercising every instruction kind in the codec.
             Command::KernelLaunch {
                 name: "gemm".into(),
-                cost: 5000,
+                threads: 64,
+                args: vec![0x0400_0000, 0x0500_0000, 0x0600_0000],
+                program: vec![
+                    Instr::Imm { dst: 4, value: 8 },
+                    Instr::Mov { dst: 5, src: 0 },
+                    Instr::Add { dst: 5, a: 5, b: 4 },
+                    Instr::Sub { dst: 6, a: 5, b: 4 },
+                    Instr::Mul { dst: 5, a: 0, b: 4 },
+                    Instr::Ld {
+                        dst: 7,
+                        addr: 1,
+                        offset: 16,
+                    },
+                    Instr::St {
+                        src: 7,
+                        addr: 3,
+                        offset: 24,
+                    },
+                    Instr::Bnz { cond: 6, target: 2 },
+                    Instr::Halt,
+                ],
             },
             Command::FenceSignal { value: 9 },
         ] {
@@ -797,6 +961,12 @@ mod tests {
                 why: "channel limit reached".into(),
             },
             VgpuError::ChannelFaulted(ChannelId(4)),
+            VgpuError::BadProgram {
+                why: "branch target 9 outside program at pc 3".into(),
+            },
+            VgpuError::KernelTimeout {
+                executed: 1_000_000,
+            },
         ];
         for err in all {
             roundtrip_resp(Response::Error(err));

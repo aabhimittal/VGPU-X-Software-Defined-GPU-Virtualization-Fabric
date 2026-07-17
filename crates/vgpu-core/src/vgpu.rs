@@ -305,8 +305,16 @@ impl Vgpu {
     /// Submit a command to one of this vGPU's channels. Only legal while
     /// Running: a suspended vGPU's rings must be a *closed set* so a
     /// migration pass can copy them without chasing a moving target.
+    ///
+    /// Kernel programs are statically validated *here*, at the doorbell:
+    /// a malformed program is a typed error to the submitter, never a
+    /// runtime surprise in the engine — and the interpreter's hot loop
+    /// gets to index registers and branch targets unchecked.
     pub fn submit(&mut self, ch: ChannelId, cmd: Command) -> Result<()> {
         self.expect_state("submit", &[VgpuState::Running])?;
+        if let Command::KernelLaunch { args, program, .. } = &cmd {
+            crate::isa::validate(program, args.len())?;
+        }
         let channel = self
             .channels
             .get_mut(ch.0 as usize)
