@@ -19,9 +19,11 @@
 //! from a socket.
 
 pub mod client;
+pub mod migrate;
 pub mod msg;
 pub mod wire;
 
 pub use client::{ClientError, ClientResult, VgpuClient};
+pub use migrate::{migrate, MigrateError, MigrateOptions};
 pub use msg::{FaultSummary, NodeInfo, Request, Response, TickSummary};
 pub use wire::{read_frame, write_frame, WireError, MAX_FRAME_LEN, VERSION};

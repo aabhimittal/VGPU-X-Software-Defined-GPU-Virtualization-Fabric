@@ -181,6 +181,47 @@ impl GpuNode {
         Ok(self.vgpu(id)?.state())
     }
 
+    // -- migration primitives ------------------------------------------------
+    //
+    // Deliberately small verbs rather than one "snapshot blob" operation:
+    // a migrator composes them (see `vgpu_proto::migrate`), and each verb
+    // reuses an existing, tested mechanism — allocation replay uses
+    // `alloc_memory`, page transfer uses `dma_read`/`dma_write`, and only
+    // channels need a dedicated export/import pair.
+
+    /// The profile a vGPU was admitted under (a migrator re-admits the
+    /// twin under the identical contract).
+    pub fn vgpu_profile(&self, id: VgpuId) -> Result<VgpuProfile> {
+        Ok(self.vgpu(id)?.profile.clone())
+    }
+
+    /// Live allocations as `(base VA, bytes)`, in creation order — replay
+    /// them on a fresh vGPU to reproduce identical guest VAs.
+    pub fn list_allocations(&self, id: VgpuId) -> Result<Vec<(GpuVirtAddr, u64)>> {
+        Ok(self.vgpu(id)?.list_allocations())
+    }
+
+    /// Harvest and clear the dirty-page set for `id` (page-aligned guest
+    /// VAs written since the previous call; a fresh vGPU reports every
+    /// mapped page). The pre-copy loop's read-and-reset primitive.
+    pub fn take_dirty(&mut self, id: VgpuId) -> Result<Vec<GpuVirtAddr>> {
+        Ok(self.vgpu_mut(id)?.take_dirty())
+    }
+
+    /// Export channel state (requires Suspended).
+    pub fn export_channels(&self, id: VgpuId) -> Result<Vec<crate::cmd::ChannelExport>> {
+        self.vgpu(id)?.export_channels()
+    }
+
+    /// Import channel state into a fresh, not-yet-started vGPU.
+    pub fn import_channels(
+        &mut self,
+        id: VgpuId,
+        exports: Vec<crate::cmd::ChannelExport>,
+    ) -> Result<()> {
+        self.vgpu_mut(id)?.import_channels(exports)
+    }
+
     // -- guest-facing operations (each confined to one vGPU) ----------------
 
     /// Allocate device memory for `id`; returns a guest VA.
@@ -190,6 +231,20 @@ impl GpuNode {
             .get_mut(&id)
             .ok_or(VgpuError::NoSuchVgpu(id))?
             .alloc_memory(vram, bytes)
+    }
+
+    /// Allocate device memory at a specific guest VA (migration replay).
+    pub fn alloc_memory_at(
+        &mut self,
+        id: VgpuId,
+        base: GpuVirtAddr,
+        bytes: u64,
+    ) -> Result<GpuVirtAddr> {
+        let Self { vgpus, vram, .. } = self;
+        vgpus
+            .get_mut(&id)
+            .ok_or(VgpuError::NoSuchVgpu(id))?
+            .alloc_memory_at(vram, base, bytes)
     }
 
     /// Free a device allocation by its base VA.
@@ -226,7 +281,7 @@ impl GpuNode {
     /// engine behaves.
     pub fn dma_write(&mut self, id: VgpuId, dst: GpuVirtAddr, data: &[u8]) -> Result<()> {
         let Self { vgpus, store, .. } = self;
-        let vgpu = vgpus.get(&id).ok_or(VgpuError::NoSuchVgpu(id))?;
+        let vgpu = vgpus.get_mut(&id).ok_or(VgpuError::NoSuchVgpu(id))?;
         let segs = vgpu
             .aspace
             .translate_range(dst, data.len() as u64, AccessKind::Write)?;
@@ -235,6 +290,7 @@ impl GpuNode {
             store.write(pa, &data[cursor..cursor + len as usize]);
             cursor += len as usize;
         }
+        vgpu.aspace.mark_dirty_range(dst, data.len() as u64); // migration substrate
         Ok(())
     }
 
@@ -288,7 +344,7 @@ impl GpuNode {
                     break;
                 };
                 let vgpu = self.vgpus.get_mut(&id).expect("picked ids exist");
-                let outcome = execute(&cmd, &vgpu.aspace, &mut self.store);
+                let outcome = execute(&cmd, &mut vgpu.aspace, &mut self.store);
                 // Charge engine occupancy regardless of outcome — a
                 // faulting command still held the engine until the fault
                 // was recognized (kernels: the instructions actually

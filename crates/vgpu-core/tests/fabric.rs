@@ -265,3 +265,163 @@ fn suspend_freezes_execution_and_resume_continues() {
         "queued work completes after resume"
     );
 }
+
+/// Every write path — host DMA, fill, copy, kernel store — must set the
+/// dirty bit on the page it wrote. A missed mark is silent
+/// post-migration corruption, so this test is the safety net under the
+/// "every write marks" invariant in `gmmu::mark_dirty_range`.
+#[test]
+fn every_write_path_marks_dirty() {
+    let mut node = node();
+    let t = node.create_vgpu(profile("t", 32, 1)).unwrap();
+    node.start_vgpu(t).unwrap();
+    let buf = node.alloc_memory(t, 4 * FRAME_SIZE).unwrap();
+    let page = |i: u64| GpuVirtAddr(buf.0 + i * FRAME_SIZE);
+
+    // Fresh allocation: every page is born dirty (never copied anywhere).
+    let initial = node.take_dirty(t).unwrap();
+    assert_eq!(initial.len(), 4);
+
+    // 1. Host DMA write.
+    node.dma_write(t, page(0), b"dma").unwrap();
+    // 2-4. Device-side fill, copy (dst = page 2), kernel store (page 3).
+    let ch = node.create_channel(t).unwrap();
+    node.submit(
+        t,
+        ch,
+        Command::MemFill {
+            dst: page(1),
+            len: 64,
+            value: 7,
+        },
+    )
+    .unwrap();
+    node.submit(
+        t,
+        ch,
+        Command::MemCopy {
+            src: page(1),
+            dst: page(2),
+            len: 64,
+        },
+    )
+    .unwrap();
+    node.submit(
+        t,
+        ch,
+        Command::KernelLaunch {
+            name: "store".to_string(),
+            threads: 1,
+            args: vec![page(3).0],
+            program: vec![
+                vgpu_core::isa::Instr::Imm { dst: 2, value: 42 },
+                vgpu_core::isa::Instr::St {
+                    src: 2,
+                    addr: 1,
+                    offset: 0,
+                },
+                vgpu_core::isa::Instr::Halt,
+            ],
+        },
+    )
+    .unwrap();
+    node.tick(1_000_000);
+
+    let mut dirty = node.take_dirty(t).unwrap();
+    dirty.sort();
+    assert_eq!(
+        dirty,
+        vec![page(0), page(1), page(2), page(3)],
+        "dma, fill, copy-dst, and kernel-store pages must all be dirty"
+    );
+    // And the set was cleared by the harvest: nothing new -> nothing dirty.
+    assert!(node.take_dirty(t).unwrap().is_empty());
+    // Copy *source* (page 1) was re-read, not re-written: after the
+    // harvest above, reading must not re-dirty anything.
+    node.submit(
+        t,
+        ch,
+        Command::MemCopy {
+            src: page(1),
+            dst: page(2),
+            len: 64,
+        },
+    )
+    .unwrap();
+    node.tick(1_000_000);
+    assert_eq!(node.take_dirty(t).unwrap(), vec![page(2)]);
+}
+
+/// The milestone-3 claim, in-core: a suspended vGPU moves to a different
+/// node — different physical frames, same guest VAs, same memory
+/// contents, same fence state — and its *pending, unexecuted* work
+/// completes correctly on the destination.
+#[test]
+fn stop_and_copy_migration_between_nodes() {
+    let mut src = node();
+    let mut dst = GpuNode::new(PhysGpuConfig {
+        name: "sim-dst".to_string(),
+        vram_bytes: 256 * FRAME_SIZE,
+        slice_cycles: 100,
+    });
+    // Occupy dst's low frames so the twin lands on *different* physical
+    // frames than the source used — proving frames don't migrate, VAs do.
+    let squatter = dst.create_vgpu(profile("squat", 8, 1)).unwrap();
+    dst.alloc_memory(squatter, 8 * FRAME_SIZE).unwrap();
+
+    // Source tenant: data + completed work + PENDING work.
+    let t = src.create_vgpu(profile("t", 32, 1)).unwrap();
+    src.start_vgpu(t).unwrap();
+    let a = src.alloc_memory(t, 2 * FRAME_SIZE).unwrap();
+    let b = src.alloc_memory(t, FRAME_SIZE).unwrap();
+    src.dma_write(t, a, b"payload before migration").unwrap();
+    let ch = src.create_channel(t).unwrap();
+    src.submit(t, ch, Command::FenceSignal { value: 1 })
+        .unwrap();
+    src.tick(1_000); // fence 1 completes on the source...
+    assert_eq!(src.fence_value(t, ch).unwrap(), 1);
+    // ...and this copy + fence 2 stay PENDING across the migration.
+    src.submit(
+        t,
+        ch,
+        Command::MemCopy {
+            src: a,
+            dst: b,
+            len: 24,
+        },
+    )
+    .unwrap();
+    src.submit(t, ch, Command::FenceSignal { value: 2 })
+        .unwrap();
+
+    // ---- the migration, from primitives ----
+    src.suspend_vgpu(t).unwrap();
+    let twin = dst.create_vgpu(src.vgpu_profile(t).unwrap()).unwrap();
+    for (base, bytes) in src.list_allocations(t).unwrap() {
+        let got = dst.alloc_memory(twin, bytes).unwrap();
+        assert_eq!(got, base, "allocation replay must reproduce guest VAs");
+    }
+    for page in src.take_dirty(t).unwrap() {
+        let mut data = vec![0u8; FRAME_SIZE as usize];
+        src.dma_read(t, page, &mut data).unwrap();
+        dst.dma_write(twin, page, &data).unwrap();
+    }
+    dst.import_channels(twin, src.export_channels(t).unwrap())
+        .unwrap();
+    dst.start_vgpu(twin).unwrap();
+    src.destroy_vgpu(t).unwrap();
+    // ---- end migration ----
+
+    // Fence state carried over; pending work has NOT run yet.
+    assert_eq!(dst.fence_value(twin, ch).unwrap(), 1);
+    // Data landed at the same guest VA.
+    let mut check = [0u8; 24];
+    dst.dma_read(twin, a, &mut check).unwrap();
+    assert_eq!(&check, b"payload before migration");
+    // The pending copy executes on the destination and signals fence 2.
+    let report = dst.tick(1_000_000);
+    assert!(report.faults.is_empty());
+    assert_eq!(dst.fence_value(twin, ch).unwrap(), 2);
+    dst.dma_read(twin, b, &mut check).unwrap();
+    assert_eq!(&check, b"payload before migration");
+}

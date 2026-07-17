@@ -11,7 +11,7 @@
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 
-use vgpu_core::cmd::Command;
+use vgpu_core::cmd::{ChannelExport, Command};
 use vgpu_core::types::{ChannelId, GpuVirtAddr, VgpuError, VgpuId};
 use vgpu_core::vgpu::{VgpuProfile, VgpuState};
 
@@ -204,6 +204,60 @@ impl VgpuClient {
             Response::Ticked(t) => Ok(t),
             _ => Err(ClientError::UnexpectedResponse("Tick")),
         }
+    }
+
+    /// Migration: allocate at a specific guest VA (heap-shape replay).
+    pub fn alloc_memory_at(
+        &mut self,
+        vgpu: VgpuId,
+        base: GpuVirtAddr,
+        bytes: u64,
+    ) -> ClientResult<GpuVirtAddr> {
+        match self.call(&Request::AllocMemoryAt { vgpu, base, bytes })? {
+            Response::Memory(va) => Ok(va),
+            _ => Err(ClientError::UnexpectedResponse("AllocMemoryAt")),
+        }
+    }
+
+    /// Migration: the profile a vGPU was admitted under.
+    pub fn vgpu_profile(&mut self, id: VgpuId) -> ClientResult<VgpuProfile> {
+        match self.call(&Request::GetProfile(id))? {
+            Response::Profile(p) => Ok(p),
+            _ => Err(ClientError::UnexpectedResponse("GetProfile")),
+        }
+    }
+
+    /// Migration: live allocations `(base VA, bytes)` in creation order.
+    pub fn list_allocations(&mut self, id: VgpuId) -> ClientResult<Vec<(GpuVirtAddr, u64)>> {
+        match self.call(&Request::ListAllocations(id))? {
+            Response::Allocations(a) => Ok(a),
+            _ => Err(ClientError::UnexpectedResponse("ListAllocations")),
+        }
+    }
+
+    /// Migration: harvest and clear the dirty-page set.
+    pub fn take_dirty(&mut self, id: VgpuId) -> ClientResult<Vec<GpuVirtAddr>> {
+        match self.call(&Request::TakeDirty(id))? {
+            Response::DirtyPages(p) => Ok(p),
+            _ => Err(ClientError::UnexpectedResponse("TakeDirty")),
+        }
+    }
+
+    /// Migration: export a suspended vGPU's channel state.
+    pub fn export_channels(&mut self, id: VgpuId) -> ClientResult<Vec<ChannelExport>> {
+        match self.call(&Request::ExportChannels(id))? {
+            Response::Channels(c) => Ok(c),
+            _ => Err(ClientError::UnexpectedResponse("ExportChannels")),
+        }
+    }
+
+    /// Migration: import channel state into a fresh vGPU.
+    pub fn import_channels(
+        &mut self,
+        vgpu: VgpuId,
+        channels: Vec<ChannelExport>,
+    ) -> ClientResult<()> {
+        self.expect_done(Request::ImportChannels { vgpu, channels }, "ImportChannels")
     }
 
     /// Describe the node.

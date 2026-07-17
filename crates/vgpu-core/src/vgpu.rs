@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::cmd::{Channel, Command};
+use crate::cmd::{Channel, ChannelState, Command};
 use crate::gmmu::{AddressSpace, VA_LIMIT};
 use crate::types::{ChannelId, GpuVirtAddr, Result, VgpuError, VgpuId, FRAME_SIZE};
 use crate::vram::{FrameRange, FrameStore, VramAllocator};
@@ -214,11 +214,36 @@ impl Vgpu {
     ///    The allocator's state must be identical to before the call.
     /// 4. **Map last** — page tables only ever point at frames we own.
     pub fn alloc_memory(&mut self, vram: &mut VramAllocator, bytes: u64) -> Result<GpuVirtAddr> {
+        let base = GpuVirtAddr(self.next_va);
+        self.alloc_memory_at(vram, base, bytes)
+    }
+
+    /// Allocate `bytes` at a *specific* page-aligned guest VA.
+    ///
+    /// This is the migration replay primitive. A source heap that has
+    /// seen frees is a bump heap with holes — replaying "allocate N
+    /// bytes" in order would compact those holes and shift every later
+    /// VA, silently invalidating the guest's live pointers. Replaying
+    /// "allocate N bytes *at* VA" reproduces the exact shape, holes
+    /// included. Overlap with an existing mapping fails atomically
+    /// (`AlreadyMapped` from the GMMU's two-pass map, after rollback).
+    pub fn alloc_memory_at(
+        &mut self,
+        vram: &mut VramAllocator,
+        base: GpuVirtAddr,
+        bytes: u64,
+    ) -> Result<GpuVirtAddr> {
         self.expect_state("alloc_memory", &[VgpuState::Running, VgpuState::Created])?;
         if bytes == 0 {
             return Err(VgpuError::BadAddress {
                 addr: GpuVirtAddr(0),
                 why: "zero-byte allocation".to_string(),
+            });
+        }
+        if !base.0.is_multiple_of(FRAME_SIZE) {
+            return Err(VgpuError::BadAddress {
+                addr: base,
+                why: "allocation base not page-aligned".to_string(),
             });
         }
         let pages = bytes.div_ceil(FRAME_SIZE);
@@ -248,12 +273,20 @@ impl Vgpu {
             remaining -= chunk;
         }
 
-        let base = GpuVirtAddr(self.next_va);
         // Map the scattered physical blocks as one contiguous VA range.
+        // On overlap (`AlreadyMapped`), roll the frames back — the map
+        // itself is two-pass atomic, so nothing was half-installed.
         let frames = ranges.iter().flat_map(|r| r.frames()).collect::<Vec<_>>();
-        self.aspace.map(base, frames.into_iter(), true)?;
+        if let Err(e) = self.aspace.map(base, frames.into_iter(), true) {
+            for r in ranges {
+                vram.free(r);
+            }
+            return Err(e);
+        }
 
-        self.next_va += pages * FRAME_SIZE;
+        // The bump pointer only ever moves forward, past any explicitly
+        // placed allocation, so future implicit allocations never collide.
+        self.next_va = self.next_va.max(base.0 + pages * FRAME_SIZE);
         self.vram_used += charged;
         self.allocations
             .insert(base.0, Allocation { pages, ranges });
@@ -335,6 +368,81 @@ impl Vgpu {
     /// predicate.
     pub fn has_pending_work(&self) -> bool {
         self.state == VgpuState::Running && self.channels.iter().any(|c| !c.ring.is_empty())
+    }
+
+    // -- migration primitives ------------------------------------------------
+
+    /// The live allocations as `(base VA, bytes)`, in creation order.
+    ///
+    /// Creation order matters: the heap is a monotonic bump allocator, so
+    /// replaying these `alloc_memory` calls in order on a *fresh* vGPU
+    /// reproduces the same guest VAs deterministically. That replay is how
+    /// a migration destination rebuilds the address-space shape without
+    /// ever seeing (or needing) the source's physical frame numbers —
+    /// `BTreeMap` iteration is ascending-by-base, which for a bump heap
+    /// *is* creation order.
+    pub fn list_allocations(&self) -> Vec<(GpuVirtAddr, u64)> {
+        self.allocations
+            .iter()
+            .map(|(base, alloc)| (GpuVirtAddr(*base), alloc.pages * FRAME_SIZE))
+            .collect()
+    }
+
+    /// Harvest and clear the dirty-page set (page-aligned guest VAs
+    /// written or newly mapped since the last call). Legal while Running —
+    /// that is the whole point of *live* pre-copy.
+    pub fn take_dirty(&mut self) -> Vec<GpuVirtAddr> {
+        self.aspace.take_dirty()
+    }
+
+    /// Export all channels' migratable state. Requires Suspended: only a
+    /// frozen vGPU's rings are a closed set, which is exactly why the
+    /// state machine has carried `Suspended` since milestone 0.
+    pub fn export_channels(&self) -> Result<Vec<crate::cmd::ChannelExport>> {
+        self.expect_state("export_channels", &[VgpuState::Suspended])?;
+        Ok(self
+            .channels
+            .iter()
+            .map(|ch| crate::cmd::ChannelExport {
+                pending: ch.ring.iter_pending().cloned().collect(),
+                completed_fence: ch.completed_fence,
+                faulted: ch.state == ChannelState::Faulted,
+            })
+            .collect())
+    }
+
+    /// Reconstruct channels from an export, on a *fresh* (Created, no
+    /// channels yet) vGPU. Pending programs are re-validated — migrated
+    /// state gets no trust discount — and dead channels arrive dead.
+    pub fn import_channels(&mut self, exports: Vec<crate::cmd::ChannelExport>) -> Result<()> {
+        self.expect_state("import_channels", &[VgpuState::Created])?;
+        if !self.channels.is_empty() {
+            return Err(VgpuError::InvalidState {
+                actual: "has channels".to_string(),
+                wanted: "import_channels into a fresh vGPU".to_string(),
+            });
+        }
+        if exports.len() as u32 > self.profile.max_channels {
+            return Err(VgpuError::ProfileUnsatisfiable {
+                why: "import exceeds channel limit".to_string(),
+            });
+        }
+        for export in exports {
+            let id = ChannelId(self.channels.len() as u32);
+            let mut channel = Channel::new(id, self.profile.ring_slots);
+            for cmd in export.pending {
+                if let Command::KernelLaunch { args, program, .. } = &cmd {
+                    crate::isa::validate(program, args.len())?;
+                }
+                channel.ring.push(cmd)?;
+            }
+            channel.completed_fence = export.completed_fence;
+            if export.faulted {
+                channel.state = ChannelState::Faulted;
+            }
+            self.channels.push(channel);
+        }
+        Ok(())
     }
 
     /// Tear everything down: unmap and scrub all memory, return all

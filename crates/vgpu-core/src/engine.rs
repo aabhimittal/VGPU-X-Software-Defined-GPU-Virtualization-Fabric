@@ -55,7 +55,7 @@ fn fault(cycles: Cycles, error: VgpuError) -> ExecOutcome {
 /// Execute one command against a vGPU's address space. `FenceSignal` is a
 /// no-op here — fences are channel state, and the channel is the caller's
 /// to update; the engine only prices it.
-pub fn execute(cmd: &Command, aspace: &AddressSpace, store: &mut FrameStore) -> ExecOutcome {
+pub fn execute(cmd: &Command, aspace: &mut AddressSpace, store: &mut FrameStore) -> ExecOutcome {
     match cmd {
         Command::MemFill { dst, len, value } => {
             // Translate FIRST, for the whole range, before writing byte
@@ -65,6 +65,7 @@ pub fn execute(cmd: &Command, aspace: &AddressSpace, store: &mut FrameStore) -> 
                     for (pa, seg_len) in segs {
                         store.fill(pa, seg_len as usize, *value);
                     }
+                    aspace.mark_dirty_range(*dst, *len); // migration substrate
                     ok(cmd.cost())
                 }
                 Err(e) => fault(cmd.cost(), e),
@@ -94,6 +95,7 @@ pub fn execute(cmd: &Command, aspace: &AddressSpace, store: &mut FrameStore) -> 
                 store.write(pa, &data[cursor..cursor + seg_len as usize]);
                 cursor += seg_len as usize;
             }
+            aspace.mark_dirty_range(*dst, *len); // migration substrate
             ok(cmd.cost())
         }
         Command::KernelLaunch {
@@ -123,7 +125,7 @@ fn run_kernel(
     threads: u32,
     args: &[u64],
     program: &[Instr],
-    aspace: &AddressSpace,
+    aspace: &mut AddressSpace,
     store: &mut FrameStore,
 ) -> ExecOutcome {
     let mut cycles: Cycles = 0;
@@ -209,10 +211,11 @@ fn load_u64(aspace: &AddressSpace, store: &FrameStore, va: u64) -> Result<u64> {
 }
 
 /// 8-byte guest store: same contract as `load_u64`.
-fn store_u64(aspace: &AddressSpace, store: &mut FrameStore, va: u64, value: u64) -> Result<()> {
+fn store_u64(aspace: &mut AddressSpace, store: &mut FrameStore, va: u64, value: u64) -> Result<()> {
     let addr = check_aligned(va)?;
     let pa = aspace.translate(addr, AccessKind::Write)?;
     store.write(pa, &value.to_le_bytes());
+    aspace.mark_dirty_range(addr, 8); // migration substrate
     Ok(())
 }
 
@@ -252,7 +255,7 @@ mod tests {
     #[test]
     fn copy_across_scattered_frames_moves_the_right_bytes() {
         // Pages 0,1 -> frames 500,2 (deliberately out of order physically).
-        let aspace = space_with(&[500, 2]);
+        let mut aspace = space_with(&[500, 2]);
         let mut store = FrameStore::new();
 
         let src = GpuVirtAddr(FRAME_SIZE - 2); // straddles the page boundary
@@ -262,14 +265,18 @@ mod tests {
                 len: 4,
                 value: 0xAB,
             },
-            &aspace,
+            &mut aspace,
             &mut store,
         );
         out.result.unwrap();
         let dst = GpuVirtAddr(16);
-        execute(&Command::MemCopy { src, dst, len: 4 }, &aspace, &mut store)
-            .result
-            .unwrap();
+        execute(
+            &Command::MemCopy { src, dst, len: 4 },
+            &mut aspace,
+            &mut store,
+        )
+        .result
+        .unwrap();
 
         for i in 0..4 {
             let pa = aspace
@@ -283,7 +290,7 @@ mod tests {
 
     #[test]
     fn fill_faults_atomically_on_unmapped_tail() {
-        let aspace = space_with(&[7]);
+        let mut aspace = space_with(&[7]);
         let mut store = FrameStore::new();
         let out = execute(
             &Command::MemFill {
@@ -291,7 +298,7 @@ mod tests {
                 len: FRAME_SIZE + 1,
                 value: 0xFF,
             },
-            &aspace,
+            &mut aspace,
             &mut store,
         );
         assert!(matches!(out.result, Err(VgpuError::PageFault { .. })));
@@ -304,14 +311,14 @@ mod tests {
 
     #[test]
     fn busy_kernel_costs_exactly_its_cycles() {
-        let aspace = AddressSpace::new();
+        let mut aspace = AddressSpace::new();
         let mut store = FrameStore::new();
-        let out = execute(&launch(1, vec![], busy(1234)), &aspace, &mut store);
+        let out = execute(&launch(1, vec![], busy(1234)), &mut aspace, &mut store);
         out.result.unwrap();
         assert_eq!(out.cycles, 1234);
 
         // Cost scales linearly with thread count.
-        let out = execute(&launch(3, vec![], busy(100)), &aspace, &mut store);
+        let out = execute(&launch(3, vec![], busy(100)), &mut aspace, &mut store);
         out.result.unwrap();
         assert_eq!(out.cycles, 300);
     }
@@ -319,17 +326,17 @@ mod tests {
     #[test]
     fn vector_add_computes_through_the_gmmu() {
         // Three arrays of 100 u64s in one mapped page.
-        let aspace = space_with(&[42]);
+        let mut aspace = space_with(&[42]);
         let mut store = FrameStore::new();
         let (a, b, c) = (0u64, 800u64, 1600u64);
         for i in 0..100u64 {
-            store_u64(&aspace, &mut store, a + i * 8, i).unwrap();
-            store_u64(&aspace, &mut store, b + i * 8, 1000 + i).unwrap();
+            store_u64(&mut aspace, &mut store, a + i * 8, i).unwrap();
+            store_u64(&mut aspace, &mut store, b + i * 8, 1000 + i).unwrap();
         }
 
         let out = execute(
             &launch(100, vec![a, b, c], vector_add()),
-            &aspace,
+            &mut aspace,
             &mut store,
         );
         out.result.unwrap();
@@ -342,7 +349,7 @@ mod tests {
 
     #[test]
     fn kernel_wild_pointer_faults_but_keeps_prior_stores() {
-        let aspace = space_with(&[3]);
+        let mut aspace = space_with(&[3]);
         let mut store = FrameStore::new();
         // Thread stores to a valid address, then dereferences an unmapped
         // one: the fault must surface AND the first store must remain —
@@ -366,21 +373,21 @@ mod tests {
             },
             Instr::Halt,
         ];
-        let out = execute(&launch(1, vec![], program), &aspace, &mut store);
+        let out = execute(&launch(1, vec![], program), &mut aspace, &mut store);
         assert!(matches!(out.result, Err(VgpuError::PageFault { .. })));
         assert_eq!(load_u64(&aspace, &store, 64).unwrap(), 7);
     }
 
     #[test]
     fn watchdog_kills_infinite_loops() {
-        let aspace = AddressSpace::new();
+        let mut aspace = AddressSpace::new();
         let mut store = FrameStore::new();
         // r1 = 1; loop: if r1 != 0 goto loop  — never halts.
         let program = vec![
             Instr::Imm { dst: 1, value: 1 },
             Instr::Bnz { cond: 1, target: 1 },
         ];
-        let out = execute(&launch(1, vec![], program), &aspace, &mut store);
+        let out = execute(&launch(1, vec![], program), &mut aspace, &mut store);
         match out.result {
             Err(VgpuError::KernelTimeout { executed }) => {
                 assert_eq!(executed, WATCHDOG_INSTRUCTIONS);
@@ -393,7 +400,7 @@ mod tests {
 
     #[test]
     fn misaligned_kernel_access_faults() {
-        let aspace = space_with(&[3]);
+        let mut aspace = space_with(&[3]);
         let mut store = FrameStore::new();
         let program = vec![
             Instr::Imm { dst: 1, value: 13 }, // not 8-byte aligned
@@ -404,13 +411,13 @@ mod tests {
             },
             Instr::Halt,
         ];
-        let out = execute(&launch(1, vec![], program), &aspace, &mut store);
+        let out = execute(&launch(1, vec![], program), &mut aspace, &mut store);
         assert!(matches!(out.result, Err(VgpuError::BadAddress { .. })));
     }
 
     #[test]
     fn counted_loop_terminates_and_costs_deterministically() {
-        let aspace = AddressSpace::new();
+        let mut aspace = AddressSpace::new();
         let mut store = FrameStore::new();
         // r1 = 10; r2 = 1; loop { r1 -= r2 } while r1 != 0
         let program = vec![
@@ -420,11 +427,11 @@ mod tests {
             Instr::Bnz { cond: 1, target: 2 },
             Instr::Halt,
         ];
-        let out = execute(&launch(1, vec![], program.clone()), &aspace, &mut store);
+        let out = execute(&launch(1, vec![], program.clone()), &mut aspace, &mut store);
         out.result.unwrap();
         // 2 setup + 10×(Sub+Bnz) + Halt = 23 cycles, every run.
         assert_eq!(out.cycles, 23);
-        let again = execute(&launch(1, vec![], program), &aspace, &mut store);
+        let again = execute(&launch(1, vec![], program), &mut aspace, &mut store);
         assert_eq!(again.cycles, 23);
     }
 }

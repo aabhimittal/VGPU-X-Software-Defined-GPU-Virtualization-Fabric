@@ -145,7 +145,7 @@ assumption:
 |---|---|
 | ~~Single-threaded~~ | Landed in M1: `vgpud`'s single-owner device thread serializes all access (the ring stays lock-free by design — see docs/06) |
 | ~~Kernels are opaque cycle costs~~ | Landed in M2: `isa.rs` + the interpreter in `engine.rs` route every kernel load/store through the GMMU, with a watchdog for runaways |
-| No TLB model → no shootdown protocol | M3 needs unmap-during-migration; the TLB model arrives with the thing that makes it observable |
+| No TLB model → no shootdown protocol | M3 migrated via suspend (no unmap-while-running), so still open; arrives with whatever first makes it observable |
 | Fences poll; no interrupts | M1's wire protocol adds completion notification |
 | One execution front-end (no engine parallelism) | Post-M2, copy/compute engine overlap becomes a scheduler dimension |
 
