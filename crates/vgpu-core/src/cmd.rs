@@ -173,6 +173,18 @@ impl Ring {
     pub fn is_empty(&self) -> bool {
         self.head == self.tail
     }
+
+    /// Iterate the queued commands, oldest first, without consuming them.
+    /// Exists for migration: a suspended vGPU's rings are a closed set
+    /// (nothing is producing or consuming), so a non-destructive walk is
+    /// exactly a snapshot of in-flight work.
+    pub fn iter_pending(&self) -> impl Iterator<Item = &Command> + '_ {
+        (0..self.len()).map(move |i| {
+            self.slots[(self.head + i) % self.slots.len()]
+                .as_ref()
+                .expect("occupied slot between head and tail")
+        })
+    }
 }
 
 /// Lifecycle of a channel.
@@ -185,6 +197,25 @@ pub enum ChannelState {
     /// *other* channels and other vGPUs are untouched — faults must never
     /// escape their blast radius.
     Faulted,
+}
+
+/// A channel's migratable state: everything a destination node needs to
+/// reconstruct the channel exactly — the still-queued commands, the fence
+/// the guest has observed, and whether the channel was already dead.
+///
+/// Note what is *absent*: head/tail indices (positions in a ring are an
+/// implementation detail; the pending commands in order are the truth),
+/// and any physical resource. This is the general shape of migratable
+/// state: guest-observable facts only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelExport {
+    /// Commands submitted but not yet executed, oldest first.
+    pub pending: Vec<Command>,
+    /// Last fence value signaled to the guest.
+    pub completed_fence: u64,
+    /// True if the channel had been killed by a fault (a dead channel
+    /// migrates as dead — migration must not resurrect it).
+    pub faulted: bool,
 }
 
 /// A channel: one submission ring plus its fence state.

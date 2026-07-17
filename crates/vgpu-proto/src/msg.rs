@@ -9,7 +9,7 @@
 //! Layout of every payload: `[VERSION u8][tag u8][fields…]`. Tags are
 //! stable protocol surface: append new ones, never renumber.
 
-use vgpu_core::cmd::Command;
+use vgpu_core::cmd::{ChannelExport, Command};
 use vgpu_core::isa::Instr;
 use vgpu_core::node::{FaultRecord, TickReport};
 use vgpu_core::types::{AccessKind, ChannelId, GpuVirtAddr, VgpuError, VgpuId};
@@ -93,6 +93,33 @@ pub enum Request {
     },
     /// Describe the node (card name, VRAM, clock).
     NodeInfo,
+    /// Migration: fetch the profile a vGPU was admitted under.
+    GetProfile(VgpuId),
+    /// Migration: list live allocations `(base VA, bytes)` in creation
+    /// order, for deterministic replay on the destination.
+    ListAllocations(VgpuId),
+    /// Migration: harvest and clear the dirty-page set (page-aligned
+    /// guest VAs). The pre-copy loop's read-and-reset primitive.
+    TakeDirty(VgpuId),
+    /// Migration: export channel state (requires the vGPU be Suspended).
+    ExportChannels(VgpuId),
+    /// Migration: import channel state into a fresh, unstarted vGPU.
+    ImportChannels {
+        /// Destination vGPU (Created, no channels yet).
+        vgpu: VgpuId,
+        /// The exported channels, in order.
+        channels: Vec<ChannelExport>,
+    },
+    /// Migration: allocate at a specific guest VA (replay preserves the
+    /// source heap's exact shape, holes included).
+    AllocMemoryAt {
+        /// Owning vGPU.
+        vgpu: VgpuId,
+        /// Required page-aligned base VA.
+        base: GpuVirtAddr,
+        /// Bytes requested.
+        bytes: u64,
+    },
 }
 
 /// Daemon → client.
@@ -116,6 +143,14 @@ pub enum Response {
     Ticked(TickSummary),
     /// NodeInfo reply.
     NodeInfo(NodeInfo),
+    /// GetProfile reply.
+    Profile(VgpuProfile),
+    /// ListAllocations reply: `(base VA, bytes)` in creation order.
+    Allocations(Vec<(GpuVirtAddr, u64)>),
+    /// TakeDirty reply: page-aligned guest VAs.
+    DirtyPages(Vec<GpuVirtAddr>),
+    /// ExportChannels reply.
+    Channels(Vec<ChannelExport>),
     /// The device model refused the operation. Full fidelity: the client
     /// re-raises exactly the `VgpuError` the core produced.
     Error(VgpuError),
@@ -381,6 +416,28 @@ fn dec_command(d: &mut Dec) -> Result<Command, WireError> {
     })
 }
 
+fn enc_channel_export(e: &mut Enc, ch: &ChannelExport) {
+    e.u32(ch.pending.len() as u32);
+    for cmd in &ch.pending {
+        enc_command(e, cmd);
+    }
+    e.u64(ch.completed_fence);
+    e.bool(ch.faulted);
+}
+
+fn dec_channel_export(d: &mut Dec) -> Result<ChannelExport, WireError> {
+    let n = d.u32()?;
+    let mut pending = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        pending.push(dec_command(d)?);
+    }
+    Ok(ChannelExport {
+        pending,
+        completed_fence: d.u64()?,
+        faulted: d.bool()?,
+    })
+}
+
 fn enc_access(e: &mut Enc, a: AccessKind) {
     e.u8(match a {
         AccessKind::Read => 0,
@@ -624,6 +681,36 @@ impl Request {
                 e.u64(*budget);
             }
             Request::NodeInfo => e.u8(15),
+            Request::GetProfile(id) => {
+                e.u8(16);
+                e.u32(id.0);
+            }
+            Request::ListAllocations(id) => {
+                e.u8(17);
+                e.u32(id.0);
+            }
+            Request::TakeDirty(id) => {
+                e.u8(18);
+                e.u32(id.0);
+            }
+            Request::ExportChannels(id) => {
+                e.u8(19);
+                e.u32(id.0);
+            }
+            Request::ImportChannels { vgpu, channels } => {
+                e.u8(20);
+                e.u32(vgpu.0);
+                e.u32(channels.len() as u32);
+                for ch in channels {
+                    enc_channel_export(&mut e, ch);
+                }
+            }
+            Request::AllocMemoryAt { vgpu, base, bytes } => {
+                e.u8(21);
+                e.u32(vgpu.0);
+                e.u64(base.0);
+                e.u64(*bytes);
+            }
         }
         e.into_bytes()
     }
@@ -669,6 +756,24 @@ impl Request {
             13 => Request::VgpuState(VgpuId(d.u32()?)),
             14 => Request::Tick { budget: d.u64()? },
             15 => Request::NodeInfo,
+            16 => Request::GetProfile(VgpuId(d.u32()?)),
+            17 => Request::ListAllocations(VgpuId(d.u32()?)),
+            18 => Request::TakeDirty(VgpuId(d.u32()?)),
+            19 => Request::ExportChannels(VgpuId(d.u32()?)),
+            20 => {
+                let vgpu = VgpuId(d.u32()?);
+                let n = d.u32()?;
+                let mut channels = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    channels.push(dec_channel_export(&mut d)?);
+                }
+                Request::ImportChannels { vgpu, channels }
+            }
+            21 => Request::AllocMemoryAt {
+                vgpu: VgpuId(d.u32()?),
+                base: GpuVirtAddr(d.u64()?),
+                bytes: d.u64()?,
+            },
             tag => {
                 return Err(WireError::BadTag {
                     context: "Request",
@@ -734,6 +839,32 @@ impl Response {
                 e.u8(10);
                 enc_error(&mut e, err);
             }
+            Response::Profile(p) => {
+                e.u8(11);
+                enc_profile(&mut e, p);
+            }
+            Response::Allocations(list) => {
+                e.u8(12);
+                e.u32(list.len() as u32);
+                for (base, bytes) in list {
+                    e.u64(base.0);
+                    e.u64(*bytes);
+                }
+            }
+            Response::DirtyPages(pages) => {
+                e.u8(13);
+                e.u32(pages.len() as u32);
+                for p in pages {
+                    e.u64(p.0);
+                }
+            }
+            Response::Channels(chans) => {
+                e.u8(14);
+                e.u32(chans.len() as u32);
+                for ch in chans {
+                    enc_channel_export(&mut e, ch);
+                }
+            }
         }
         e.into_bytes()
     }
@@ -775,6 +906,31 @@ impl Response {
                 clock: d.u64()?,
             }),
             10 => Response::Error(dec_error(&mut d)?),
+            11 => Response::Profile(dec_profile(&mut d)?),
+            12 => {
+                let n = d.u32()?;
+                let mut list = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    list.push((GpuVirtAddr(d.u64()?), d.u64()?));
+                }
+                Response::Allocations(list)
+            }
+            13 => {
+                let n = d.u32()?;
+                let mut pages = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    pages.push(GpuVirtAddr(d.u64()?));
+                }
+                Response::DirtyPages(pages)
+            }
+            14 => {
+                let n = d.u32()?;
+                let mut chans = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    chans.push(dec_channel_export(&mut d)?);
+                }
+                Response::Channels(chans)
+            }
             tag => {
                 return Err(WireError::BadTag {
                     context: "Response",
@@ -884,6 +1040,30 @@ mod tests {
         roundtrip_req(Request::VgpuState(VgpuId(1)));
         roundtrip_req(Request::Tick { budget: 10_000 });
         roundtrip_req(Request::NodeInfo);
+        roundtrip_req(Request::GetProfile(VgpuId(2)));
+        roundtrip_req(Request::ListAllocations(VgpuId(2)));
+        roundtrip_req(Request::TakeDirty(VgpuId(2)));
+        roundtrip_req(Request::ExportChannels(VgpuId(2)));
+        roundtrip_req(Request::ImportChannels {
+            vgpu: VgpuId(2),
+            channels: vec![ChannelExport {
+                pending: vec![
+                    Command::MemFill {
+                        dst: GpuVirtAddr(0x0400_0000),
+                        len: 64,
+                        value: 3,
+                    },
+                    Command::FenceSignal { value: 5 },
+                ],
+                completed_fence: 4,
+                faulted: false,
+            }],
+        });
+        roundtrip_req(Request::AllocMemoryAt {
+            vgpu: VgpuId(2),
+            base: GpuVirtAddr(0x0400_0000),
+            bytes: 1 << 20,
+        });
     }
 
     #[test]
@@ -920,6 +1100,26 @@ mod tests {
             uncommitted_vram: 1 << 32,
             clock: 123456,
         }));
+        roundtrip_resp(Response::Profile(VgpuProfile {
+            name: "mig".into(),
+            vram_bytes: 1 << 30,
+            compute_weight: 2,
+            max_channels: 4,
+            ring_slots: 128,
+        }));
+        roundtrip_resp(Response::Allocations(vec![
+            (GpuVirtAddr(0x0400_0000), 1 << 20),
+            (GpuVirtAddr(0x0500_0000), 1 << 16),
+        ]));
+        roundtrip_resp(Response::DirtyPages(vec![
+            GpuVirtAddr(0x0400_0000),
+            GpuVirtAddr(0x0401_0000),
+        ]));
+        roundtrip_resp(Response::Channels(vec![ChannelExport {
+            pending: vec![Command::FenceSignal { value: 9 }],
+            completed_fence: 8,
+            faulted: true,
+        }]));
     }
 
     /// Exhaustive over the error enum: adding a `VgpuError` variant

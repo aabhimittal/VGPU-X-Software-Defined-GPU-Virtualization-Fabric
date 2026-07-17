@@ -59,6 +59,12 @@ pub const VA_LIMIT: u64 = 1 << VA_BITS;
 struct Pte {
     frame: FrameNum,
     writable: bool,
+    /// The hardware "dirty" (accessed/dirty) bit, repurposed exactly the
+    /// way live migration repurposes it on real MMUs: set when the page
+    /// is written, harvested and cleared by `take_dirty`. Starts `true`
+    /// on map — a page that has never been copied anywhere is, from a
+    /// migrator's point of view, dirty by definition.
+    dirty: bool,
 }
 
 /// A second-level table: 1024 slots, each possibly holding a valid PTE.
@@ -163,7 +169,11 @@ impl AddressSpace {
             let va = GpuVirtAddr(base.0 + i as u64 * FRAME_SIZE);
             let (pde, pte, _) = split_va(va).expect("validated in pass 1");
             let table = self.directory[pde].get_or_insert_with(PageTable::new);
-            table.entries[pte] = Some(Pte { frame, writable });
+            table.entries[pte] = Some(Pte {
+                frame,
+                writable,
+                dirty: true, // never-copied = dirty (see Pte docs)
+            });
             table.live += 1;
             self.mapped_pages += 1;
         }
@@ -259,6 +269,63 @@ impl AddressSpace {
             cur += take;
         }
         Ok(segs)
+    }
+
+    // -- dirty tracking (the migration substrate) ---------------------------
+
+    /// Set the dirty bit on every page overlapping `[addr, addr+len)`.
+    ///
+    /// Callers are the write paths — the engine's fill/copy/kernel-store
+    /// and the node's host DMA — invoked *after* a successful write
+    /// translation. The invariant "every write marks" is load-bearing for
+    /// migration correctness (a missed mark is silent post-migration
+    /// corruption), so it is pinned by tests that exercise every write
+    /// path and assert the page shows up dirty
+    /// (`every_write_path_marks_dirty` in `fabric.rs`).
+    ///
+    /// Pages in the range are expected to be mapped (the write was just
+    /// translated); an unmapped page here is an engine bug, hence
+    /// `debug_assert`, not `Err`.
+    pub fn mark_dirty_range(&mut self, addr: GpuVirtAddr, len: u64) {
+        let mut cur = addr.0 - addr.frame_offset(); // round down to page
+        let end = addr.0.saturating_add(len);
+        while cur < end {
+            let Ok((pde, pte, _)) = split_va(GpuVirtAddr(cur)) else {
+                debug_assert!(false, "mark_dirty_range beyond VA space");
+                return;
+            };
+            let entry = self.directory[pde]
+                .as_mut()
+                .and_then(|t| t.entries[pte].as_mut());
+            match entry {
+                Some(e) => e.dirty = true,
+                None => debug_assert!(false, "mark_dirty_range on unmapped page"),
+            }
+            cur += FRAME_SIZE;
+        }
+    }
+
+    /// Harvest and clear the dirty set: the page-aligned guest VA of every
+    /// page written (or newly mapped) since the previous call. This is the
+    /// read-and-reset cycle every pre-copy migration loop performs against
+    /// MMU dirty bits; clearing on read is what makes successive rounds
+    /// converge to "what changed while I was copying".
+    pub fn take_dirty(&mut self) -> Vec<GpuVirtAddr> {
+        let mut dirty = Vec::new();
+        for (pde_idx, slot) in self.directory.iter_mut().enumerate() {
+            let Some(table) = slot else { continue };
+            for (pte_idx, entry) in table.entries.iter_mut().enumerate() {
+                if let Some(pte) = entry {
+                    if pte.dirty {
+                        pte.dirty = false;
+                        let va = ((pde_idx as u64) << (OFFSET_BITS + PTE_BITS))
+                            | ((pte_idx as u64) << OFFSET_BITS);
+                        dirty.push(GpuVirtAddr(va));
+                    }
+                }
+            }
+        }
+        dirty
     }
 }
 

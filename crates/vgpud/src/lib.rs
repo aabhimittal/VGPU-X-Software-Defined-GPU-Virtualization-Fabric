@@ -246,6 +246,16 @@ fn handle(node: &mut GpuNode, req: Request) -> Response {
             uncommitted_vram: node.uncommitted_vram(),
             clock: node.clock(),
         }),
+        Request::GetProfile(id) => map(node.vgpu_profile(id), Response::Profile),
+        Request::ListAllocations(id) => map(node.list_allocations(id), Response::Allocations),
+        Request::TakeDirty(id) => map(node.take_dirty(id), Response::DirtyPages),
+        Request::ExportChannels(id) => map(node.export_channels(id), Response::Channels),
+        Request::ImportChannels { vgpu, channels } => {
+            map(node.import_channels(vgpu, channels), |()| Response::Done)
+        }
+        Request::AllocMemoryAt { vgpu, base, bytes } => {
+            map(node.alloc_memory_at(vgpu, base, bytes), Response::Memory)
+        }
     }
 }
 
