@@ -110,13 +110,12 @@ pub struct NodeMetrics {
 
 impl NodeMetrics {
     /// Fraction of elapsed logical time spent executing work, in percent.
-    /// Returns 0 for a node that has never run.
+    /// A node that has never run reports 0 rather than dividing by its
+    /// zero clock — `checked_div` states that in one expression.
     pub fn utilization_pct(&self) -> u64 {
-        if self.clock == 0 {
-            0
-        } else {
-            self.busy_cycles * 100 / self.clock
-        }
+        (self.busy_cycles * 100)
+            .checked_div(self.clock)
+            .unwrap_or(0)
     }
 }
 
