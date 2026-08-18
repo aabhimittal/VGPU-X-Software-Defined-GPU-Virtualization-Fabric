@@ -11,7 +11,9 @@
 
 use vgpu_core::cmd::{ChannelExport, Command};
 use vgpu_core::isa::Instr;
+use vgpu_core::metrics::{NodeMetrics, TenantMetrics};
 use vgpu_core::node::{FaultRecord, TickReport};
+use vgpu_core::sched::QosLimits;
 use vgpu_core::types::{AccessKind, ChannelId, GpuVirtAddr, VgpuError, VgpuId};
 use vgpu_core::vgpu::{VgpuProfile, VgpuState};
 
@@ -110,6 +112,8 @@ pub enum Request {
         /// The exported channels, in order.
         channels: Vec<ChannelExport>,
     },
+    /// Telemetry: a full per-tenant + per-node metrics snapshot.
+    GetMetrics,
     /// Migration: allocate at a specific guest VA (replay preserves the
     /// source heap's exact shape, holes included).
     AllocMemoryAt {
@@ -151,6 +155,8 @@ pub enum Response {
     DirtyPages(Vec<GpuVirtAddr>),
     /// ExportChannels reply.
     Channels(Vec<ChannelExport>),
+    /// GetMetrics reply.
+    Metrics(NodeMetrics),
     /// The device model refused the operation. Full fidelity: the client
     /// re-raises exactly the `VgpuError` the core produced.
     Error(VgpuError),
@@ -214,21 +220,33 @@ pub struct NodeInfo {
 // Codecs
 // ---------------------------------------------------------------------------
 
-fn enc_profile(e: &mut Enc, p: &VgpuProfile) {
+pub(crate) fn enc_profile(e: &mut Enc, p: &VgpuProfile) {
     e.str(&p.name);
     e.u64(p.vram_bytes);
     e.u32(p.compute_weight);
     e.u32(p.max_channels);
     e.u64(p.ring_slots as u64);
+    // Optional QoS limits: 0 encodes "unset", since a share of 0% is
+    // rejected by profile validation anyway.
+    e.u32(p.qos.max_share_pct.unwrap_or(0));
+    e.u32(p.qos.min_share_pct.unwrap_or(0));
 }
 
-fn dec_profile(d: &mut Dec) -> Result<VgpuProfile, WireError> {
+fn opt_pct(v: u32) -> Option<u32> {
+    (v > 0).then_some(v)
+}
+
+pub(crate) fn dec_profile(d: &mut Dec) -> Result<VgpuProfile, WireError> {
     Ok(VgpuProfile {
         name: d.str()?,
         vram_bytes: d.u64()?,
         compute_weight: d.u32()?,
         max_channels: d.u32()?,
         ring_slots: d.u64()? as usize,
+        qos: QosLimits {
+            max_share_pct: opt_pct(d.u32()?),
+            min_share_pct: opt_pct(d.u32()?),
+        },
     })
 }
 
@@ -416,7 +434,7 @@ fn dec_command(d: &mut Dec) -> Result<Command, WireError> {
     })
 }
 
-fn enc_channel_export(e: &mut Enc, ch: &ChannelExport) {
+pub(crate) fn enc_channel_export(e: &mut Enc, ch: &ChannelExport) {
     e.u32(ch.pending.len() as u32);
     for cmd in &ch.pending {
         enc_command(e, cmd);
@@ -426,7 +444,7 @@ fn enc_channel_export(e: &mut Enc, ch: &ChannelExport) {
     e.bool(ch.faulted);
 }
 
-fn dec_channel_export(d: &mut Dec) -> Result<ChannelExport, WireError> {
+pub(crate) fn dec_channel_export(d: &mut Dec) -> Result<ChannelExport, WireError> {
     let n = d.u32()?;
     let mut pending = Vec::with_capacity(n as usize);
     for _ in 0..n {
@@ -437,6 +455,75 @@ fn dec_channel_export(d: &mut Dec) -> Result<ChannelExport, WireError> {
         completed_fence: d.u64()?,
         submitted_fence: d.u64()?,
         faulted: d.bool()?,
+    })
+}
+
+fn enc_metrics(e: &mut Enc, m: &NodeMetrics) {
+    e.str(&m.name);
+    e.u64(m.clock);
+    e.u64(m.busy_cycles);
+    e.u64(m.capped_idle_cycles);
+    e.u64(m.vram_bytes);
+    e.u64(m.uncommitted_vram);
+    e.u64(m.faults);
+    e.u32(m.tenants.len() as u32);
+    for t in &m.tenants {
+        e.u32(t.vgpu.0);
+        e.str(&t.profile_name);
+        enc_state(e, t.state);
+        e.u64(t.cycles_consumed);
+        e.u64(t.commands_completed);
+        e.u64(t.faults);
+        e.u64(t.bytes_dma_in);
+        e.u64(t.bytes_dma_out);
+        e.u64(t.kernel_launches);
+        e.u64(t.vram_used);
+        e.u64(t.vram_budget);
+        e.u64(t.queued_commands);
+        e.u32(t.channels);
+        e.u64(t.window_consumed);
+        e.bool(t.capped_out);
+    }
+}
+
+fn dec_metrics(d: &mut Dec) -> Result<NodeMetrics, WireError> {
+    let name = d.str()?;
+    let clock = d.u64()?;
+    let busy_cycles = d.u64()?;
+    let capped_idle_cycles = d.u64()?;
+    let vram_bytes = d.u64()?;
+    let uncommitted_vram = d.u64()?;
+    let faults = d.u64()?;
+    let n = d.u32()?;
+    let mut tenants = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        tenants.push(TenantMetrics {
+            vgpu: VgpuId(d.u32()?),
+            profile_name: d.str()?,
+            state: dec_state(d)?,
+            cycles_consumed: d.u64()?,
+            commands_completed: d.u64()?,
+            faults: d.u64()?,
+            bytes_dma_in: d.u64()?,
+            bytes_dma_out: d.u64()?,
+            kernel_launches: d.u64()?,
+            vram_used: d.u64()?,
+            vram_budget: d.u64()?,
+            queued_commands: d.u64()?,
+            channels: d.u32()?,
+            window_consumed: d.u64()?,
+            capped_out: d.bool()?,
+        });
+    }
+    Ok(NodeMetrics {
+        name,
+        clock,
+        busy_cycles,
+        capped_idle_cycles,
+        vram_bytes,
+        uncommitted_vram,
+        faults,
+        tenants,
     })
 }
 
@@ -725,6 +812,7 @@ impl Request {
                     enc_channel_export(&mut e, ch);
                 }
             }
+            Request::GetMetrics => e.u8(22),
             Request::AllocMemoryAt { vgpu, base, bytes } => {
                 e.u8(21);
                 e.u32(vgpu.0);
@@ -789,6 +877,7 @@ impl Request {
                 }
                 Request::ImportChannels { vgpu, channels }
             }
+            22 => Request::GetMetrics,
             21 => Request::AllocMemoryAt {
                 vgpu: VgpuId(d.u32()?),
                 base: GpuVirtAddr(d.u64()?),
@@ -885,6 +974,10 @@ impl Response {
                     enc_channel_export(&mut e, ch);
                 }
             }
+            Response::Metrics(m) => {
+                e.u8(15);
+                enc_metrics(&mut e, m);
+            }
         }
         e.into_bytes()
     }
@@ -951,6 +1044,7 @@ impl Response {
                 }
                 Response::Channels(chans)
             }
+            15 => Response::Metrics(dec_metrics(&mut d)?),
             tag => {
                 return Err(WireError::BadTag {
                     context: "Response",
@@ -985,6 +1079,7 @@ mod tests {
             compute_weight: 3,
             max_channels: 8,
             ring_slots: 256,
+            qos: QosLimits::default(),
         }));
         roundtrip_req(Request::StartVgpu(VgpuId(7)));
         roundtrip_req(Request::SuspendVgpu(VgpuId(7)));
@@ -1127,6 +1222,12 @@ mod tests {
             compute_weight: 2,
             max_channels: 4,
             ring_slots: 128,
+            // QoS must survive the wire, or a migrated tenant would land
+            // on its new node with its contract silently erased.
+            qos: QosLimits {
+                max_share_pct: Some(25),
+                min_share_pct: Some(10),
+            },
         }));
         roundtrip_resp(Response::Allocations(vec![
             (GpuVirtAddr(0x0400_0000), 1 << 20),

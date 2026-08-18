@@ -22,6 +22,7 @@ let mut node = GpuNode::new(PhysGpuConfig {
 let tenant = node.create_vgpu(VgpuProfile {
     name: "sim-2m.1x".into(), vram_bytes: 32 * FRAME_SIZE,
     compute_weight: 1, max_channels: 2, ring_slots: 64,
+    ..Default::default()          // no QoS caps: pure proportional share
 })?;
 node.start_vgpu(tenant)?;
 
@@ -51,6 +52,21 @@ let tenant = c.create_vgpu(profile)?;          // same operations,
 c.start_vgpu(tenant)?;                          // same errors, same
 let buf = c.alloc_memory(tenant, 4096)?;        // isolation — through
 c.dma_write(tenant, buf, b"hello, device")?;    // a socket
+```
+
+Profiles can also carry a hard ceiling and a guaranteed floor — the two
+things a scheduler weight can never express, since weights only bind under
+contention:
+
+```rust
+VgpuProfile {
+    name: "sim-quarter-card".into(), vram_bytes: 32 * FRAME_SIZE,
+    compute_weight: 1, max_channels: 2, ring_slots: 64,
+    qos: QosLimits {
+        max_share_pct: Some(25),  // never more, even on an idle GPU
+        min_share_pct: Some(10),  // never less, however crowded it gets
+    },
+}
 ```
 
 ## Why this project exists
@@ -88,6 +104,8 @@ VGPU-X fixes that by building the whole stack where you can watch it run:
 | 7 | [docs/07-walkthrough-shim.md](docs/07-walkthrough-shim.md) | Line-by-line: the kernel ISA and interpreter, the watchdog (TDR), and the CUDA-shaped guest shim |
 | 8 | [docs/08-walkthrough-migration.md](docs/08-walkthrough-migration.md) | Line-by-line: dirty bits, heap-shape replay, and the pre-copy live migration driver |
 | 9 | [docs/09-walkthrough-fabric.md](docs/09-walkthrough-fabric.md) | Line-by-line: control vs data plane, best-fit placement, evacuation, and the closing argument |
+| 10 | [docs/10-industrial-edge-cases.md](docs/10-industrial-edge-cases.md) | Six defects found by *probing* a system with 85 passing tests, and what generalizes from each |
+| 11 | [docs/11-operating-the-fabric.md](docs/11-operating-the-fabric.md) | Telemetry, QoS caps and reservations, and checkpoint/restore/clone — making it runnable |
 
 ## Repository map
 
@@ -98,8 +116,9 @@ crates/vgpu-core/          the device model (M0)
   src/gmmu.rs              per-vGPU two-level page tables (the isolation boundary)
   src/cmd.rs               commands, rings, doorbell semantics, fences, channels
   src/isa.rs               the kernel ISA: 9 instructions, static validation (M2)
+  src/metrics.rs           per-tenant and per-node telemetry counters
   src/vgpu.rs              profiles, budgets, lifecycle state machine
-  src/sched.rs             weighted virtual-runtime fair scheduler
+  src/sched.rs             vruntime fair scheduler + QoS caps and reservations
   src/engine.rs            translate-then-touch command execution
   src/node.rs              the mediator: admission, DMA, the tick loop
   tests/fabric.rs          multi-tenant isolation & fairness scenarios
@@ -108,6 +127,7 @@ crates/vgpu-proto/         the wire protocol (M1)
   src/msg.rs               Request/Response vocabulary; lossless VgpuError codec
   src/client.rs            VgpuClient, the blocking typed client
   src/migrate.rs           the pre-copy live migration driver (M3)
+  src/checkpoint.rs        checkpoint / restore / clone, composed from those verbs
 crates/vgpu-fabric/        the control plane (M4)
   src/lib.rs               best-fit placement, inventory, migration, evacuation
   tests/fabric.rs          a three-node fleet: exact placement, drains, registry
@@ -119,13 +139,15 @@ crates/vgpud/              the node daemon (M1)
   src/main.rs              the vgpud binary
   tests/daemon.rs          end-to-end over real TCP: isolation, errors, concurrency
   tests/migration.rs       live migration between two daemons (M3)
+  tests/hardening.rs       hostile clients, live-guest migration, framing limits
+  tests/checkpoint.rs      freeze to bytes, restore, clone across nodes
 docs/                      the book
 ```
 
 ## Running it
 
 ```
-cargo test                    # 85 tests: unit, integration, doctest
+cargo test                    # 110 tests: unit, integration, doctest
 cargo run -p vgpud -- --help  # run a node daemon
 cargo doc --open              # the API reference is written as part of the text
 ```
@@ -145,10 +167,18 @@ values, including exact fair-share cycle counts.
 | **M4 — The fabric** | `vgpu-fabric`: best-fit placement, live inventory, tenant migration, node drain | ✅ |
 
 The roadmap is complete: guest app → shim → wire → daemon → device model,
-coordinated by a control plane, with live migration between nodes. The
-final chapter ([docs/09](docs/09-walkthrough-fabric.md)) closes with where
-a reader could take it next (TLB shootdowns, engine parallelism, post-copy
-migration, a C-ABI shim, consensus-backed fabric HA).
+coordinated by a control plane, with live migration between nodes.
+
+Beyond the roadmap, two further passes:
+
+| Pass | Contents | Status |
+|------|----------|--------|
+| **Hardening** | Six defects found by probing rather than reading — a cross-tenant DoS via fault accounting, an unbounded host allocation from a client-supplied length, live migration that could not survive a live guest, a fence clock that ran backwards, and a fabric that invented capacity ([docs/10](docs/10-industrial-edge-cases.md)) | ✅ |
+| **Operability** | Telemetry (counters joined to stable tenant identity), QoS hard caps and reservations, and checkpoint/restore/clone ([docs/11](docs/11-operating-the-fabric.md)) | ✅ |
+
+Where a reader could take it next: TLB shootdowns, copy/compute engine
+parallelism, post-copy migration, a C-ABI shim for real `LD_PRELOAD`
+interposition, or consensus-backed fabric HA.
 
 ## License
 

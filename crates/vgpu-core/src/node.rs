@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::cmd::{ChannelState, Command};
 use crate::engine::execute;
+use crate::metrics::{Counters, NodeMetrics, TenantMetrics};
 use crate::sched::Scheduler;
 use crate::types::{
     AccessKind, ChannelId, Cycles, GpuVirtAddr, Result, VgpuError, VgpuId, MAX_DMA_BYTES,
@@ -65,6 +66,12 @@ pub struct TickReport {
     pub commands: u64,
     /// Channels killed by faults this tick.
     pub faults: Vec<FaultRecord>,
+    /// Cycles the GPU sat idle *with work queued* because every runnable
+    /// tenant had spent its QoS ceiling. This is the visible price of a
+    /// hard cap, and it belongs in telemetry rather than hidden: an
+    /// operator seeing idle cycles next to queued work should be able to
+    /// tell "capped by policy" from "nothing to do".
+    pub idle_cycles: Cycles,
 }
 
 /// One channel-killing fault.
@@ -94,6 +101,11 @@ pub struct GpuNode {
     /// the foundation models *guaranteed* VRAM, not ballooning.
     committed_vram: u64,
     clock: Cycles,
+    /// Per-tenant counters, keyed alongside `vgpus`.
+    counters: BTreeMap<VgpuId, Counters>,
+    /// Node-wide counters (see `metrics` for why these are counters).
+    busy_cycles: Cycles,
+    capped_idle_cycles: Cycles,
 }
 
 impl GpuNode {
@@ -110,6 +122,9 @@ impl GpuNode {
             next_id: 0,
             committed_vram: 0,
             clock: 0,
+            counters: BTreeMap::new(),
+            busy_cycles: 0,
+            capped_idle_cycles: 0,
         }
     }
 
@@ -126,6 +141,19 @@ impl GpuNode {
     /// Real cycles a vGPU has consumed (scheduler account).
     pub fn consumed(&self, id: VgpuId) -> Cycles {
         self.sched.consumed(id)
+    }
+
+    /// Is this tenant currently held back by its own QoS ceiling?
+    /// Surfaced because "my job is slow" and "my job is slow *because I
+    /// bought a quarter card*" are different support tickets, and only
+    /// the device can tell them apart.
+    pub fn is_capped_out(&self, id: VgpuId) -> bool {
+        self.sched.is_capped_out(id)
+    }
+
+    /// Cycles this tenant has taken inside the current QoS window.
+    pub fn window_consumed(&self, id: VgpuId) -> Cycles {
+        self.sched.window_consumed(id)
     }
 
     /// VRAM bytes not yet promised to any profile.
@@ -150,13 +178,35 @@ impl GpuNode {
                 why: "insufficient uncommitted VRAM on this node".to_string(),
             });
         }
+        // Compute reservations are admission-controlled exactly like VRAM
+        // budgets: a floor is a promise, and promises that sum past the
+        // card cannot all be kept. Refusing here is the only honest
+        // moment — after admission the only options are breaking an SLA
+        // or evicting someone.
+        let reserved: u32 = self
+            .vgpus
+            .values()
+            .filter_map(|v| v.profile.qos.min_share_pct)
+            .sum();
+        if let Some(want) = profile.qos.min_share_pct {
+            if reserved + want > 100 {
+                return Err(VgpuError::ProfileUnsatisfiable {
+                    why: format!(
+                        "compute reservations would total {}%, over 100%",
+                        reserved + want
+                    ),
+                });
+            }
+        }
         let id = VgpuId(self.next_id);
         self.next_id += 1; // never reused: stale IDs must not alias new tenants
         let weight = profile.compute_weight;
+        let qos = profile.qos;
         self.committed_vram += profile.vram_bytes;
         self.vgpus.insert(id, Vgpu::new(id, profile)?);
-        self.sched.register(id, weight);
+        self.sched.register_with_qos(id, weight, qos);
         self.rr_cursor.insert(id, 0);
+        self.counters.insert(id, Counters::default());
         Ok(id)
     }
 
@@ -168,6 +218,7 @@ impl GpuNode {
         self.committed_vram -= vgpu.profile.vram_bytes;
         self.sched.unregister(id);
         self.rr_cursor.remove(&id);
+        self.counters.remove(&id);
         self.vgpus.remove(&id);
         Ok(())
     }
@@ -311,13 +362,16 @@ impl GpuNode {
             cursor += len as usize;
         }
         vgpu.aspace.mark_dirty_range(dst, data.len() as u64); // migration substrate
+        if let Some(c) = self.counters.get_mut(&id) {
+            c.bytes_dma_in += data.len() as u64;
+        }
         Ok(())
     }
 
     /// Device→host DMA: read a vGPU's memory at `src` into a host buffer.
-    pub fn dma_read(&self, id: VgpuId, src: GpuVirtAddr, buf: &mut [u8]) -> Result<()> {
+    pub fn dma_read(&mut self, id: VgpuId, src: GpuVirtAddr, buf: &mut [u8]) -> Result<()> {
         check_transfer_len(buf.len() as u64)?;
-        let vgpu = self.vgpu(id)?;
+        let vgpu = self.vgpus.get(&id).ok_or(VgpuError::NoSuchVgpu(id))?;
         let segs = vgpu
             .aspace
             .translate_range(src, buf.len() as u64, AccessKind::Read)?;
@@ -325,6 +379,9 @@ impl GpuNode {
         for (pa, len) in segs {
             self.store.read(pa, &mut buf[cursor..cursor + len as usize]);
             cursor += len as usize;
+        }
+        if let Some(c) = self.counters.get_mut(&id) {
+            c.bytes_dma_out += buf.len() as u64;
         }
         Ok(())
     }
@@ -355,7 +412,19 @@ impl GpuNode {
                 self.sched.set_runnable(*id, vgpu.has_pending_work());
             }
             // (2) Whom does fairness owe the next slice?
-            let Some(id) = self.sched.pick() else { break };
+            let Some(id) = self.sched.pick() else {
+                if self.sched.all_runnable_are_capped() {
+                    // Work is queued, but every tenant holding it has
+                    // spent its ceiling. The GPU idles — that is what a
+                    // hard cap *is* — and the window must still advance,
+                    // or the cap would stall time and then refill itself.
+                    let idle = budget - report.cycles;
+                    self.sched.advance_idle(idle);
+                    self.clock += idle;
+                    report.idle_cycles += idle;
+                }
+                break;
+            };
 
             // (3) Drain up to one slice from this vGPU.
             let slice_target = self.config.slice_cycles.min(budget - report.cycles);
@@ -371,6 +440,11 @@ impl GpuNode {
                 // was recognized (kernels: the instructions actually
                 // executed before faulting).
                 slice_used += outcome.cycles.max(1);
+                if let Command::KernelLaunch { .. } = cmd {
+                    if let Some(c) = self.counters.get_mut(&id) {
+                        c.kernel_launches += 1;
+                    }
+                }
                 match outcome.result {
                     Ok(()) => {
                         if let Command::FenceSignal { value } = cmd {
@@ -380,9 +454,15 @@ impl GpuNode {
                             vgpu.channels[ch.0 as usize].completed_fence = value;
                         }
                         report.commands += 1;
+                        if let Some(c) = self.counters.get_mut(&id) {
+                            c.commands_completed += 1;
+                        }
                     }
                     Err(error) => {
                         vgpu.channels[ch.0 as usize].kill(error.clone());
+                        if let Some(c) = self.counters.get_mut(&id) {
+                            c.faults += 1;
+                        }
                         report.faults.push(FaultRecord {
                             vgpu: id,
                             channel: ch,
@@ -405,7 +485,53 @@ impl GpuNode {
         }
 
         self.clock += report.cycles;
+        self.busy_cycles += report.cycles;
+        self.capped_idle_cycles += report.idle_cycles;
         report
+    }
+
+    /// Collect a full telemetry snapshot: the card, plus every tenant.
+    ///
+    /// Reads state the node already maintains — nothing here is sampled
+    /// on the hot path, which is deliberate. Metrics that cost something
+    /// to collect get collected rarely and are stale exactly when they
+    /// matter; metrics that cost nothing get scraped every few seconds
+    /// and are there when someone is paging.
+    pub fn metrics(&self) -> NodeMetrics {
+        let tenants = self
+            .vgpus
+            .iter()
+            .map(|(id, v)| {
+                let c = self.counters.get(id).cloned().unwrap_or_default();
+                TenantMetrics {
+                    vgpu: *id,
+                    profile_name: v.profile.name.clone(),
+                    state: v.state(),
+                    cycles_consumed: self.sched.consumed(*id),
+                    commands_completed: c.commands_completed,
+                    faults: c.faults,
+                    bytes_dma_in: c.bytes_dma_in,
+                    bytes_dma_out: c.bytes_dma_out,
+                    kernel_launches: c.kernel_launches,
+                    vram_used: v.vram_used(),
+                    vram_budget: v.profile.vram_bytes,
+                    queued_commands: v.queued_commands(),
+                    channels: v.channel_count(),
+                    window_consumed: self.sched.window_consumed(*id),
+                    capped_out: self.sched.is_capped_out(*id),
+                }
+            })
+            .collect::<Vec<_>>();
+        NodeMetrics {
+            name: self.config.name.clone(),
+            clock: self.clock,
+            busy_cycles: self.busy_cycles,
+            capped_idle_cycles: self.capped_idle_cycles,
+            vram_bytes: self.config.vram_bytes,
+            uncommitted_vram: self.uncommitted_vram(),
+            faults: tenants.iter().map(|t| t.faults).sum(),
+            tenants,
+        }
     }
 
     /// Pop the next command from `id`'s channels, rotating the cursor so
@@ -437,6 +563,7 @@ impl GpuNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sched::QosLimits;
     use crate::types::FRAME_SIZE;
 
     fn small_node() -> GpuNode {
@@ -454,6 +581,7 @@ mod tests {
             compute_weight: weight,
             max_channels: 4,
             ring_slots: 64,
+            qos: QosLimits::default(),
         }
     }
 

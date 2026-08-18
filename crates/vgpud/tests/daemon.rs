@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use vgpu_core::cmd::Command;
 use vgpu_core::node::PhysGpuConfig;
+use vgpu_core::sched::QosLimits;
 use vgpu_core::types::{GpuVirtAddr, VgpuError, FRAME_SIZE};
 use vgpu_core::vgpu::{VgpuProfile, VgpuState};
 use vgpu_proto::{ClientError, VgpuClient};
@@ -42,6 +43,7 @@ fn profile(name: &str, frames: u64, weight: u32) -> VgpuProfile {
         compute_weight: weight,
         max_channels: 4,
         ring_slots: 256,
+        qos: QosLimits::default(),
     }
 }
 

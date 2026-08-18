@@ -52,6 +52,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 
+use vgpu_core::metrics::{NodeMetrics, TenantMetrics};
 use vgpu_core::types::{VgpuError, VgpuId};
 use vgpu_core::vgpu::VgpuProfile;
 use vgpu_proto::{migrate, ClientError, MigrateError, MigrateOptions, VgpuClient};
@@ -106,6 +107,22 @@ pub struct NodeReport {
     pub uncommitted_vram: u64,
     /// Tenants the fabric has placed here.
     pub tenants: Vec<TenantId>,
+}
+
+/// One node's telemetry, joined to fabric-stable tenant identity.
+#[derive(Debug, Clone)]
+pub struct NodeTelemetry {
+    /// Fabric id of the node.
+    pub node: NodeId,
+    /// Its data-plane address.
+    pub addr: SocketAddr,
+    /// Everything the node reported about itself.
+    pub metrics: NodeMetrics,
+    /// Per-tenant metrics paired with the fabric's stable `TenantId`.
+    /// `None` means the node is running a vGPU the fabric did not place —
+    /// worth surfacing rather than hiding, since unmanaged tenants
+    /// consume capacity the fabric is busy promising to someone else.
+    pub tenants: Vec<(Option<TenantId>, TenantMetrics)>,
 }
 
 /// Control-plane failures.
@@ -250,6 +267,61 @@ impl Fabric {
             });
         }
         Ok(reports)
+    }
+
+    /// Fleet-wide telemetry: every node's metrics, with the fabric's
+    /// tenant ids attached so a number can be traced back to a customer.
+    ///
+    /// A node knows it is running `vgpu3`; only the fabric knows `vgpu3`
+    /// is `tenant7`, who has migrated twice this week. Joining the two is
+    /// the whole reason a control plane collects telemetry rather than
+    /// leaving operators to scrape nodes: **the identity an alert needs
+    /// is the stable one**, and nodes do not have it.
+    pub fn telemetry(&mut self) -> FabricResult<Vec<NodeTelemetry>> {
+        let nodes: Vec<(NodeId, SocketAddr)> =
+            self.nodes.iter().map(|(id, n)| (*id, n.addr)).collect();
+        let mut out = Vec::with_capacity(nodes.len());
+        for (id, addr) in nodes {
+            let metrics = self.connect(addr)?.metrics()?;
+            let tenants = metrics
+                .tenants
+                .iter()
+                .map(|t| {
+                    let tenant = self
+                        .tenants
+                        .iter()
+                        .find(|(_, p)| p.node == id && p.vgpu == t.vgpu)
+                        .map(|(tid, _)| *tid);
+                    (tenant, t.clone())
+                })
+                .collect();
+            out.push(NodeTelemetry {
+                node: id,
+                addr,
+                metrics,
+                tenants,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The node an operator should look at first: highest utilization
+    /// among nodes actually hosting tenants. Returns `None` for an empty
+    /// or entirely idle fleet.
+    ///
+    /// Deliberately advisory rather than automatic. A fabric that
+    /// rebalances on its own reading of "hot" will chase transients and
+    /// migrate tenants during their busiest minute — the classic
+    /// autoscaler failure. Surfacing the candidate and letting a human
+    /// (or a policy with hysteresis) decide is the conservative default;
+    /// `migrate_tenant` is right there when the decision is made.
+    pub fn hottest_node(&mut self) -> FabricResult<Option<(NodeId, u64)>> {
+        Ok(self
+            .telemetry()?
+            .into_iter()
+            .filter(|t| !t.tenants.is_empty())
+            .map(|t| (t.node, t.metrics.utilization_pct()))
+            .max_by_key(|(id, util)| (*util, std::cmp::Reverse(*id))))
     }
 
     /// Place a tenant: choose a node by **best fit**, admit, start.

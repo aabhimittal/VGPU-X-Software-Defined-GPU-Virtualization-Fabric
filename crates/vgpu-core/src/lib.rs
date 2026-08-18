@@ -53,6 +53,7 @@
 //!     compute_weight: 1,
 //!     max_channels: 2,
 //!     ring_slots: 64,
+//!     ..Default::default()   // no QoS caps: pure proportional share
 //! }).unwrap();
 //! node.start_vgpu(tenant).unwrap();
 //!
@@ -81,6 +82,7 @@ pub mod cmd;
 pub mod engine;
 pub mod gmmu;
 pub mod isa;
+pub mod metrics;
 pub mod node;
 pub mod sched;
 pub mod types;
@@ -90,7 +92,9 @@ pub mod vram;
 /// One-line import for the common surface.
 pub mod prelude {
     pub use crate::cmd::{ChannelState, Command};
+    pub use crate::metrics::{NodeMetrics, TenantMetrics};
     pub use crate::node::{GpuNode, PhysGpuConfig, TickReport};
+    pub use crate::sched::QosLimits;
     pub use crate::types::{
         AccessKind, ChannelId, Cycles, GpuVirtAddr, VgpuError, VgpuId, FRAME_SIZE,
     };

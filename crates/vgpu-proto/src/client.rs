@@ -12,6 +12,7 @@ use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 
 use vgpu_core::cmd::{ChannelExport, Command};
+use vgpu_core::metrics::NodeMetrics;
 use vgpu_core::types::{ChannelId, GpuVirtAddr, VgpuError, VgpuId};
 use vgpu_core::vgpu::{VgpuProfile, VgpuState};
 
@@ -203,6 +204,14 @@ impl VgpuClient {
         match self.call(&Request::Tick { budget })? {
             Response::Ticked(t) => Ok(t),
             _ => Err(ClientError::UnexpectedResponse("Tick")),
+        }
+    }
+
+    /// Telemetry: a per-tenant and per-node metrics snapshot.
+    pub fn metrics(&mut self) -> ClientResult<NodeMetrics> {
+        match self.call(&Request::GetMetrics)? {
+            Response::Metrics(m) => Ok(m),
+            _ => Err(ClientError::UnexpectedResponse("GetMetrics")),
         }
     }
 

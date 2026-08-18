@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 
 use vgpu_core::isa::{self, Instr};
 use vgpu_core::node::PhysGpuConfig;
+use vgpu_core::sched::QosLimits;
 use vgpu_core::types::{FRAME_SIZE, MAX_DMA_BYTES};
 use vgpu_core::vgpu::VgpuProfile;
 use vgpu_shim::{Device, ShimError};
@@ -34,6 +35,7 @@ fn profile() -> VgpuProfile {
         compute_weight: 1,
         max_channels: 4,
         ring_slots: 256,
+        qos: QosLimits::default(),
     }
 }
 
@@ -216,5 +218,6 @@ fn big_profile() -> VgpuProfile {
         compute_weight: 1,
         max_channels: 4,
         ring_slots: 256,
+        qos: QosLimits::default(),
     }
 }

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::cmd::{Channel, ChannelState, Command};
 use crate::gmmu::{AddressSpace, VA_LIMIT};
+use crate::sched::QosLimits;
 use crate::types::{ChannelId, GpuVirtAddr, Result, VgpuError, VgpuId, FRAME_SIZE};
 use crate::vram::{FrameRange, FrameStore, VramAllocator};
 
@@ -36,6 +37,28 @@ pub struct VgpuProfile {
     pub max_channels: u32,
     /// Slots per channel ring.
     pub ring_slots: usize,
+    /// Optional hard ceiling and guaranteed floor on compute share.
+    /// Defaults to neither, which is pure proportional share — the
+    /// behaviour every profile had before QoS existed.
+    pub qos: QosLimits,
+}
+
+impl Default for VgpuProfile {
+    /// A profile skeleton whose resource fields are deliberately *not*
+    /// usable (`validate` rejects a zero VRAM budget). It exists so
+    /// callers can write `..Default::default()` and pick up the optional
+    /// tail — today just `qos` — without restating it. Optional policy
+    /// should cost nothing to ignore.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            vram_bytes: 0,
+            compute_weight: 1,
+            max_channels: 1,
+            ring_slots: 2,
+            qos: QosLimits::default(),
+        }
+    }
 }
 
 impl VgpuProfile {
@@ -61,6 +84,28 @@ impl VgpuProfile {
             return Err(VgpuError::ProfileUnsatisfiable {
                 why: "need at least 1 channel and 2 ring slots".to_string(),
             });
+        }
+        for (pct, what) in [
+            (self.qos.max_share_pct, "max_share_pct"),
+            (self.qos.min_share_pct, "min_share_pct"),
+        ] {
+            if let Some(p) = pct {
+                if p == 0 || p > 100 {
+                    return Err(VgpuError::ProfileUnsatisfiable {
+                        why: format!("{what} must be in 1..=100, got {p}"),
+                    });
+                }
+            }
+        }
+        // A floor above the ceiling is unsatisfiable by construction, and
+        // silently clamping it would hand the operator a contract the
+        // node quietly rewrote.
+        if let (Some(min), Some(max)) = (self.qos.min_share_pct, self.qos.max_share_pct) {
+            if min > max {
+                return Err(VgpuError::ProfileUnsatisfiable {
+                    why: format!("min_share_pct {min} exceeds max_share_pct {max}"),
+                });
+            }
         }
         Ok(())
     }
@@ -164,6 +209,18 @@ impl Vgpu {
     /// Bytes allocated against the profile budget.
     pub fn vram_used(&self) -> u64 {
         self.vram_used
+    }
+
+    /// Commands sitting in this tenant's rings right now (telemetry).
+    /// Sustained depth means the tenant is limited by the GPU; zero means
+    /// it is limited by itself, and the two want opposite responses.
+    pub fn queued_commands(&self) -> u64 {
+        self.channels.iter().map(|c| c.ring.len() as u64).sum()
+    }
+
+    /// Live channel count (telemetry).
+    pub fn channel_count(&self) -> u32 {
+        self.channels.len() as u32
     }
 
     fn expect_state(&self, wanted_op: &'static str, ok: &[VgpuState]) -> Result<()> {
@@ -496,6 +553,7 @@ mod tests {
             compute_weight: 1,
             max_channels: 2,
             ring_slots: 8,
+            qos: QosLimits::default(),
         }
     }
 
