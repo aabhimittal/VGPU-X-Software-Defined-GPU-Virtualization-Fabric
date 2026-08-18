@@ -226,3 +226,115 @@ fn fence_regression_is_refused_over_the_wire() {
     assert_eq!(c.fence_value(t, ch).unwrap(), 8);
     node.shutdown();
 }
+
+/// **A cap survives a migration.** Found by probing the QoS feature the
+/// same day it was written — the fix for one blind spot does not protect
+/// you from the next one.
+///
+/// A tenant capped at 25% that has spent its window on node A used to
+/// arrive on node B with a fresh budget, so a tenant migrated once per
+/// window collected its ceiling twice. The distinction that matters:
+/// vruntime is *relative* to a node's other tenants and is correctly
+/// dropped, while a cap is an *absolute* promise that means the same
+/// thing on every card. Deciding which kind each piece of state is, is
+/// the whole question a migration has to answer.
+#[test]
+fn a_qos_cap_is_not_refreshed_by_migrating() {
+    let (na, nb) = (spawn(), spawn());
+    let mut a = VgpuClient::connect(na.addr).unwrap();
+    let mut b = VgpuClient::connect(nb.addr).unwrap();
+
+    let quarter = VgpuProfile {
+        qos: QosLimits {
+            max_share_pct: Some(25),
+            min_share_pct: None,
+        },
+        ..profile(8)
+    };
+    let t = a.create_vgpu(quarter).unwrap();
+    a.start_vgpu(t).unwrap();
+    let ch = a.create_channel(t).unwrap();
+    for _ in 0..40 {
+        a.submit(
+            t,
+            ch,
+            Command::KernelLaunch {
+                name: "hungry".into(),
+                threads: 1,
+                args: vec![],
+                program: vgpu_core::isa::busy(1_000),
+            },
+        )
+        .unwrap();
+    }
+    // Spend the whole quarter-window on node A.
+    a.tick(50_000).unwrap();
+    let spent = a.qos_window(t).unwrap();
+    assert_eq!(spent, 25_000, "the cap was reached on the source");
+
+    let twin = migrate(&mut a, &mut b, t, &MigrateOptions::default()).unwrap();
+
+    assert_eq!(
+        b.qos_window(twin).unwrap(),
+        spent,
+        "the spend travels with the tenant"
+    );
+    // And it is still refused more time in this window: the GPU idles
+    // rather than handing over a second helping.
+    let report = b.tick(20_000).unwrap();
+    assert_eq!(
+        b.metrics().unwrap().tenants[0].cycles_consumed,
+        0,
+        "no cycles on the destination until the window rolls"
+    );
+    assert_eq!(report.cycles, 0);
+    na.shutdown();
+    nb.shutdown();
+}
+
+/// The transfer is monotone upward, so the operation cannot be turned
+/// into a way to *shed* a cap. A caller can only ever throttle itself —
+/// the safe direction is the only direction available, which is what
+/// makes it safe to expose at all.
+#[test]
+fn adopting_a_qos_window_can_only_raise_it() {
+    let node = spawn();
+    let mut c = VgpuClient::connect(node.addr).unwrap();
+    let quarter = VgpuProfile {
+        qos: QosLimits {
+            max_share_pct: Some(25),
+            min_share_pct: None,
+        },
+        ..profile(8)
+    };
+    let t = c.create_vgpu(quarter).unwrap();
+    c.start_vgpu(t).unwrap();
+    let ch = c.create_channel(t).unwrap();
+    for _ in 0..40 {
+        c.submit(
+            t,
+            ch,
+            Command::KernelLaunch {
+                name: "k".into(),
+                threads: 1,
+                args: vec![],
+                program: vgpu_core::isa::busy(1_000),
+            },
+        )
+        .unwrap();
+    }
+    c.tick(50_000).unwrap();
+    assert_eq!(c.qos_window(t).unwrap(), 25_000);
+
+    // Try to wipe the spend — refused by construction, not by policy.
+    c.adopt_qos_window(t, 0).unwrap();
+    assert_eq!(
+        c.qos_window(t).unwrap(),
+        25_000,
+        "adopting a lower figure must not shed the cap"
+    );
+    // Raising works, since throttling yourself is always allowed.
+    c.adopt_qos_window(t, 40_000).unwrap();
+    assert_eq!(c.qos_window(t).unwrap(), 40_000);
+    node.shutdown();
+}

@@ -114,6 +114,18 @@ pub enum Request {
     },
     /// Telemetry: a full per-tenant + per-node metrics snapshot.
     GetMetrics,
+    /// Migration: read a tenant's QoS window spend, so a cap survives a
+    /// move between nodes.
+    GetQosWindow(VgpuId),
+    /// Migration: carry a QoS window spend onto the destination. Raises
+    /// the figure only, never lowers it, so it cannot be used to shed a
+    /// cap — see `GpuNode::adopt_qos_window`.
+    AdoptQosWindow {
+        /// Destination vGPU.
+        vgpu: VgpuId,
+        /// Cycles already spent in the current window on the source.
+        consumed: u64,
+    },
     /// Migration: allocate at a specific guest VA (replay preserves the
     /// source heap's exact shape, holes included).
     AllocMemoryAt {
@@ -157,6 +169,8 @@ pub enum Response {
     Channels(Vec<ChannelExport>),
     /// GetMetrics reply.
     Metrics(NodeMetrics),
+    /// GetQosWindow reply: cycles spent in the current QoS window.
+    QosWindow(u64),
     /// The device model refused the operation. Full fidelity: the client
     /// re-raises exactly the `VgpuError` the core produced.
     Error(VgpuError),
@@ -813,6 +827,15 @@ impl Request {
                 }
             }
             Request::GetMetrics => e.u8(22),
+            Request::GetQosWindow(id) => {
+                e.u8(23);
+                e.u32(id.0);
+            }
+            Request::AdoptQosWindow { vgpu, consumed } => {
+                e.u8(24);
+                e.u32(vgpu.0);
+                e.u64(*consumed);
+            }
             Request::AllocMemoryAt { vgpu, base, bytes } => {
                 e.u8(21);
                 e.u32(vgpu.0);
@@ -878,6 +901,11 @@ impl Request {
                 Request::ImportChannels { vgpu, channels }
             }
             22 => Request::GetMetrics,
+            23 => Request::GetQosWindow(VgpuId(d.u32()?)),
+            24 => Request::AdoptQosWindow {
+                vgpu: VgpuId(d.u32()?),
+                consumed: d.u64()?,
+            },
             21 => Request::AllocMemoryAt {
                 vgpu: VgpuId(d.u32()?),
                 base: GpuVirtAddr(d.u64()?),
@@ -978,6 +1006,10 @@ impl Response {
                 e.u8(15);
                 enc_metrics(&mut e, m);
             }
+            Response::QosWindow(v) => {
+                e.u8(16);
+                e.u64(*v);
+            }
         }
         e.into_bytes()
     }
@@ -1045,6 +1077,7 @@ impl Response {
                 Response::Channels(chans)
             }
             15 => Response::Metrics(dec_metrics(&mut d)?),
+            16 => Response::QosWindow(d.u64()?),
             tag => {
                 return Err(WireError::BadTag {
                     context: "Response",
@@ -1156,6 +1189,12 @@ mod tests {
         roundtrip_req(Request::Tick { budget: 10_000 });
         roundtrip_req(Request::NodeInfo);
         roundtrip_req(Request::GetProfile(VgpuId(2)));
+        roundtrip_req(Request::GetMetrics);
+        roundtrip_req(Request::GetQosWindow(VgpuId(2)));
+        roundtrip_req(Request::AdoptQosWindow {
+            vgpu: VgpuId(2),
+            consumed: 25_000,
+        });
         roundtrip_req(Request::ListAllocations(VgpuId(2)));
         roundtrip_req(Request::TakeDirty(VgpuId(2)));
         roundtrip_req(Request::ExportChannels(VgpuId(2)));
@@ -1233,6 +1272,7 @@ mod tests {
             (GpuVirtAddr(0x0400_0000), 1 << 20),
             (GpuVirtAddr(0x0500_0000), 1 << 16),
         ]));
+        roundtrip_resp(Response::QosWindow(25_000));
         roundtrip_resp(Response::DirtyPages(vec![
             GpuVirtAddr(0x0400_0000),
             GpuVirtAddr(0x0401_0000),

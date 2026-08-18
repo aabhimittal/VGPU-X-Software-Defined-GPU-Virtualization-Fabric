@@ -274,6 +274,21 @@ impl Scheduler {
         self.accounts.get(&id).map_or(0, |a| a.window_consumed)
     }
 
+    /// Adopt a window-consumption figure from elsewhere — a tenant that
+    /// migrated mid-window brings its spend with it.
+    ///
+    /// **Monotone upward on purpose.** The value can only ever raise the
+    /// tenant's recorded spend, never lower it, so the operation is
+    /// useless as an attack: a caller can throttle itself and nothing
+    /// else. That asymmetry is what makes it safe to expose on an
+    /// unauthenticated device API at all — the safe direction is the only
+    /// direction available.
+    pub fn adopt_window_consumed(&mut self, id: VgpuId, consumed: Cycles) {
+        if let Some(acc) = self.accounts.get_mut(&id) {
+            acc.window_consumed = acc.window_consumed.max(consumed);
+        }
+    }
+
     /// Is this tenant currently held back by its own ceiling? Exposed
     /// because "my job is slow" and "my job is slow *because I bought a
     /// quarter card*" are different support tickets.

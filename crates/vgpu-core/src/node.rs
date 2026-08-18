@@ -156,6 +156,23 @@ impl GpuNode {
         self.sched.window_consumed(id)
     }
 
+    /// Adopt a QoS window figure carried from another node (migration).
+    ///
+    /// A cap is an *absolute* promise to a customer — "never more than
+    /// 25%" — so it has to survive a move. This is exactly where it
+    /// differs from vruntime, which migration deliberately drops:
+    /// vruntime is meaningful only relative to a node's *other* tenants,
+    /// so importing it would be nonsense, while a cap means the same
+    /// thing on every card in the fleet. Without this, a tenant migrated
+    /// once per window would collect its ceiling twice over.
+    ///
+    /// Only ever raises the figure (see `Scheduler::adopt_window_consumed`).
+    pub fn adopt_qos_window(&mut self, id: VgpuId, consumed: Cycles) -> Result<()> {
+        self.vgpu(id)?; // exists?
+        self.sched.adopt_window_consumed(id, consumed);
+        Ok(())
+    }
+
     /// VRAM bytes not yet promised to any profile.
     pub fn uncommitted_vram(&self) -> u64 {
         self.config.vram_bytes - self.committed_vram

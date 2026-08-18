@@ -215,6 +215,19 @@ impl VgpuClient {
         }
     }
 
+    /// Migration: read a tenant's QoS window spend.
+    pub fn qos_window(&mut self, id: VgpuId) -> ClientResult<u64> {
+        match self.call(&Request::GetQosWindow(id))? {
+            Response::QosWindow(v) => Ok(v),
+            _ => Err(ClientError::UnexpectedResponse("GetQosWindow")),
+        }
+    }
+
+    /// Migration: carry a QoS window spend onto the destination.
+    pub fn adopt_qos_window(&mut self, vgpu: VgpuId, consumed: u64) -> ClientResult<()> {
+        self.expect_done(Request::AdoptQosWindow { vgpu, consumed }, "AdoptQosWindow")
+    }
+
     /// Migration: allocate at a specific guest VA (heap-shape replay).
     pub fn alloc_memory_at(
         &mut self,

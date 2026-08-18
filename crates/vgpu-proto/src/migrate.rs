@@ -39,6 +39,15 @@
 //! node's *other* tenants, so a migrated vGPU joins the destination at
 //! its high-water mark like any new arrival (see `sched::register`).
 //!
+//! The QoS *window* spend, by contrast, does migrate — and the contrast
+//! is the point. A weight is relative, so importing one would be
+//! meaningless; a cap is absolute ("never more than 25%") and means the
+//! same thing on every card in the fleet. Dropping it would let a tenant
+//! migrated once per window collect its ceiling twice, which is a
+//! contract violation rather than a fairness wobble. Deciding *per piece
+//! of state* whether it is relative or absolute is the whole question a
+//! migration has to answer.
+//!
 //! # Structure drift: the guest keeps allocating while you copy
 //!
 //! "Live" means the guest is *running*, and a running guest allocates
@@ -212,6 +221,16 @@ fn migrate_inner(
     // rewinds the source would have refused).
     let channels = src.export_channels(vgpu)?;
     dst.import_channels(twin, channels)?;
+
+    // (6b) Carry the QoS window spend. A cap is an *absolute* promise
+    // ("never more than 25%"), so it must survive a move — unlike
+    // vruntime, which is meaningful only against a node's other tenants
+    // and is deliberately dropped. Without this, a tenant migrated once
+    // per window would collect its ceiling twice.
+    let spent = src.qos_window(vgpu)?;
+    if spent > 0 {
+        dst.adopt_qos_window(twin, spent)?;
+    }
 
     // (7) Flip: twin goes live, source ceases to exist.
     dst.start_vgpu(twin)?;

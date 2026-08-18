@@ -147,7 +147,7 @@ docs/                      the book
 ## Running it
 
 ```
-cargo test                    # 110 tests: unit, integration, doctest
+cargo test                    # 112 tests: unit, integration, doctest
 cargo run -p vgpud -- --help  # run a node daemon
 cargo doc --open              # the API reference is written as part of the text
 ```

@@ -143,7 +143,40 @@ version is a corruption you see in six months — so `from_bytes` checks it
 first, and is total: arbitrary bytes yield a `WireError`, never a panic.
 A checkpoint is exactly as trustworthy as a socket.
 
-## 11.4 What the tests prove
+## 11.4 Probing the new features, immediately
+
+Chapter 10's lesson is that a suite grown alongside a feature inherits
+its author's blind spots, so these three features were probed the same
+day they were written rather than shipped on the strength of their own
+tests. Three probes confirmed correct behaviour: a faulted channel
+survives a checkpoint still faulted, an empty tenant round-trips (a
+50-byte file), and a clone of a 60%-reserved tenant is refused at 120%
+by admission control.
+
+The fourth found a real gap. **A tenant capped at 25% that had spent its
+window arrived on a migration destination with a fresh budget** — so a
+tenant migrated once per window collected its ceiling twice.
+
+The interesting part is the shape of the mistake. Milestone 3 had
+already decided, correctly, that vruntime does *not* migrate: fairness is
+relative to a node's other tenants, so importing a vruntime would be
+meaningless. When QoS arrived, its window spend inherited that decision
+by default — and it is the opposite kind of state. A weight is relative;
+a cap is absolute, and "never more than 25%" means the same thing on
+every card in the fleet. **A migration has to decide, for each piece of
+state it carries, whether that state is relative or absolute**, and a new
+feature does not get to inherit the answer from an older one.
+
+The fix carries the window spend across the move, with one deliberate
+property: `adopt_qos_window` only ever *raises* the figure. A caller can
+therefore throttle itself and nothing else, which is what makes the
+operation safe to expose on an unauthenticated device API — the safe
+direction is the only direction available.
+
+Pinned by `a_qos_cap_is_not_refreshed_by_migrating` and
+`adopting_a_qos_window_can_only_raise_it`.
+
+## 11.5 What the tests prove
 
 | Claim | Test |
 |---|---|
@@ -159,8 +192,10 @@ A checkpoint is exactly as trustworthy as a socket.
 | A clone can land on a different node | `a_clone_can_be_restored_onto_another_node` |
 | Corrupt, truncated, and stale checkpoints are refused, never trusted | `corrupt_and_stale_checkpoints_are_refused_not_trusted` |
 | Restore obeys admission control and leaves nothing behind on failure | `restoring_still_obeys_admission_control` |
+| A cap is not refreshed by migrating | `a_qos_cap_is_not_refreshed_by_migrating` |
+| Carrying a window spend can only throttle, never exempt | `adopting_a_qos_window_can_only_raise_it` |
 
-## 11.5 The through-line
+## 11.6 The through-line
 
 Each feature here is a case of the same pattern: an operational question
 the existing abstractions could not express, answered by extending the

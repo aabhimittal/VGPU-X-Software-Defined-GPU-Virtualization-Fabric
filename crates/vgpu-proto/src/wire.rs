@@ -25,10 +25,11 @@ use std::io::{self, Read, Write};
 /// v3 = milestone 3 (five migration messages: profile fetch, allocation
 /// listing, dirty-page harvest, channel export/import); v4 = the
 /// hardening pass (two new error variants, `ChannelExport` carries the
-/// fence high-water mark).
+/// fence high-water mark); v5 = operability (QoS limits on profiles,
+/// telemetry, QoS-window transfer for migration).
 /// The command layout changed shape, so v1 peers must be refused — this
 /// bump is the versioning policy doing its job, not an inconvenience.
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 
 /// Upper bound on a frame body. Guards the daemon against a malicious or
 /// broken client sending a 4 GiB length prefix and OOMing the host — the

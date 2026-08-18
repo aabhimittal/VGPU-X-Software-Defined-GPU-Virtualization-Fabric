@@ -263,6 +263,10 @@ fn handle(node: &mut GpuNode, req: Request) -> Response {
             map(node.import_channels(vgpu, channels), |()| Response::Done)
         }
         Request::GetMetrics => Response::Metrics(node.metrics()),
+        Request::GetQosWindow(id) => Response::QosWindow(node.window_consumed(id)),
+        Request::AdoptQosWindow { vgpu, consumed } => {
+            map(node.adopt_qos_window(vgpu, consumed), |()| Response::Done)
+        }
         Request::AllocMemoryAt { vgpu, base, bytes } => {
             map(node.alloc_memory_at(vgpu, base, bytes), Response::Memory)
         }
