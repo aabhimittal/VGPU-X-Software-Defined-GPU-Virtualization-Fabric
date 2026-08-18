@@ -9,6 +9,23 @@
 //! includes kernels: the interpreter routes every `Ld`/`St` through the
 //! same page walk as the copy engine.
 //!
+//! # Faults are charged for what they *did*, not what they asked for
+//!
+//! A command that dies during address validation performed a page walk
+//! and nothing else, so that is what it is charged (`FAULT_COST`).
+//! Charging the *nominal* cost instead — what the command would have
+//! cost had it run — looks conservative and is in fact a cross-tenant
+//! denial of service: `MemFill { len: u64::MAX/2 }` at an unmapped
+//! address does no work whatsoever, yet its nominal price is ~5.7e17
+//! cycles. Bill that to the tick and one instantly-failing command from
+//! one tenant consumes the entire scheduling window, delivering exactly
+//! zero cycles to every innocent neighbour. The general rule, and the
+//! reason this is stated so prominently: **in a multi-tenant system,
+//! any quantity derived from an untrusted request must be bounded by
+//! work actually performed, or it becomes a weapon.**
+//! (`a_cheap_fault_cannot_starve_the_node` in `fabric.rs` holds the
+//! line.)
+//!
 //! # Fault atomicity differs by engine class, faithfully
 //!
 //! Fills and copies validate their whole range *before* touching a byte —
@@ -23,6 +40,13 @@ use crate::gmmu::AddressSpace;
 use crate::isa::{Instr, REG_COUNT, WATCHDOG_INSTRUCTIONS};
 use crate::types::{AccessKind, Cycles, GpuVirtAddr, Result, VgpuError};
 use crate::vram::FrameStore;
+
+/// What recognizing a fault costs: one page walk, matching `Instr::Ld`'s
+/// memory price. Deliberately a small constant rather than the command's
+/// nominal cost — see the module docs. Faults remain self-limiting for
+/// other reasons too: a fault kills its channel, and a profile caps how
+/// many channels a tenant may ever open.
+const FAULT_COST: Cycles = 4;
 
 /// What executing one command did: how long the engine was occupied, and
 /// whether the command completed. The two are separate because a faulting
@@ -68,17 +92,19 @@ pub fn execute(cmd: &Command, aspace: &mut AddressSpace, store: &mut FrameStore)
                     aspace.mark_dirty_range(*dst, *len); // migration substrate
                     ok(cmd.cost())
                 }
-                Err(e) => fault(cmd.cost(), e),
+                // Validation failed: nothing was touched, so nothing but
+                // the walk is billed (module docs).
+                Err(e) => fault(FAULT_COST, e),
             }
         }
         Command::MemCopy { src, dst, len } => {
             let src_segs = match aspace.translate_range(*src, *len, AccessKind::Read) {
                 Ok(s) => s,
-                Err(e) => return fault(cmd.cost(), e),
+                Err(e) => return fault(FAULT_COST, e),
             };
             let dst_segs = match aspace.translate_range(*dst, *len, AccessKind::Write) {
                 Ok(s) => s,
-                Err(e) => return fault(cmd.cost(), e),
+                Err(e) => return fault(FAULT_COST, e),
             };
             // Stage through a host-side buffer rather than walking both
             // segment lists in lockstep: trivially correct for

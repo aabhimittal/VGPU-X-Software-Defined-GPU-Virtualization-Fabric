@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 
 use vgpu_core::isa::{self, Instr};
 use vgpu_core::node::PhysGpuConfig;
-use vgpu_core::types::FRAME_SIZE;
+use vgpu_core::types::{FRAME_SIZE, MAX_DMA_BYTES};
 use vgpu_core::vgpu::VgpuProfile;
 use vgpu_shim::{Device, ShimError};
 use vgpud::{serve, DaemonConfig, ServerHandle};
@@ -186,4 +186,35 @@ fn malloc_over_budget_is_a_typed_error() {
         other => panic!("expected VramBudgetExceeded, got {other:?}"),
     }
     daemon.shutdown();
+}
+
+/// The shim hides the device's per-transfer ceiling: a guest copying more
+/// than `MAX_DMA_BYTES` in one call gets it chunked, the way real drivers
+/// hide DMA-ring segmentation behind a single `cudaMemcpy`.
+#[test]
+fn the_shim_chunks_transfers_larger_than_the_device_limit() {
+    let daemon = spawn_daemon();
+    let mut dev = Device::connect(daemon.addr, big_profile()).unwrap();
+    let n = MAX_DMA_BYTES + 4096; // deliberately not a chunk multiple
+    let buf = dev.malloc(n).unwrap();
+
+    let payload: Vec<u8> = (0..n as usize).map(|i| (i % 251) as u8).collect();
+    dev.memcpy_htod(buf, &payload).unwrap();
+    let back = dev.memcpy_dtoh(buf, n).unwrap();
+    assert_eq!(back.len(), payload.len());
+    assert_eq!(back, payload, "a chunked round-trip must be byte-exact");
+
+    dev.destroy().unwrap();
+    daemon.shutdown();
+}
+
+/// A profile with room for the chunking test's oversized buffer.
+fn big_profile() -> VgpuProfile {
+    VgpuProfile {
+        name: "shim-big".to_string(),
+        vram_bytes: 200 * FRAME_SIZE,
+        compute_weight: 1,
+        max_channels: 4,
+        ring_slots: 256,
+    }
 }

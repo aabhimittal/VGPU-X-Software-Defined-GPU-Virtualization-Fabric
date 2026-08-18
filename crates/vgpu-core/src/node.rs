@@ -16,9 +16,28 @@ use std::collections::{BTreeMap, HashMap};
 use crate::cmd::{ChannelState, Command};
 use crate::engine::execute;
 use crate::sched::Scheduler;
-use crate::types::{AccessKind, ChannelId, Cycles, GpuVirtAddr, Result, VgpuError, VgpuId};
+use crate::types::{
+    AccessKind, ChannelId, Cycles, GpuVirtAddr, Result, VgpuError, VgpuId, MAX_DMA_BYTES,
+};
 use crate::vgpu::{Vgpu, VgpuProfile, VgpuState};
 use crate::vram::{FrameStore, VramAllocator};
+
+/// Reject transfers past the device's per-transfer ceiling.
+///
+/// Checked before any buffer is sized. On the network path the length
+/// arrives from a client, and `vec![0; len]` with an unbounded `len` is
+/// an abort — of the process serving *every* tenant on the node. The
+/// device enforcing its own limit means the daemon can size a buffer
+/// only after the core has agreed the number is sane.
+pub fn check_transfer_len(len: u64) -> Result<()> {
+    if len > MAX_DMA_BYTES {
+        return Err(VgpuError::TransferTooLarge {
+            requested: len,
+            limit: MAX_DMA_BYTES,
+        });
+    }
+    Ok(())
+}
 
 /// Static description of the physical GPU this node manages.
 #[derive(Debug, Clone)]
@@ -280,6 +299,7 @@ impl GpuNode {
     /// physical back door, which is exactly how an IOMMU-protected DMA
     /// engine behaves.
     pub fn dma_write(&mut self, id: VgpuId, dst: GpuVirtAddr, data: &[u8]) -> Result<()> {
+        check_transfer_len(data.len() as u64)?;
         let Self { vgpus, store, .. } = self;
         let vgpu = vgpus.get_mut(&id).ok_or(VgpuError::NoSuchVgpu(id))?;
         let segs = vgpu
@@ -296,6 +316,7 @@ impl GpuNode {
 
     /// Device→host DMA: read a vGPU's memory at `src` into a host buffer.
     pub fn dma_read(&self, id: VgpuId, src: GpuVirtAddr, buf: &mut [u8]) -> Result<()> {
+        check_transfer_len(buf.len() as u64)?;
         let vgpu = self.vgpu(id)?;
         let segs = vgpu
             .aspace

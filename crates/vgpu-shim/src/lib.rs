@@ -44,7 +44,7 @@ use std::net::ToSocketAddrs;
 
 use vgpu_core::cmd::Command;
 use vgpu_core::isa::Instr;
-use vgpu_core::types::{ChannelId, GpuVirtAddr, VgpuId};
+use vgpu_core::types::{ChannelId, GpuVirtAddr, VgpuId, MAX_DMA_BYTES};
 use vgpu_core::vgpu::VgpuProfile;
 use vgpu_proto::{ClientError, VgpuClient};
 
@@ -143,13 +143,32 @@ impl Device {
     }
 
     /// `cudaMemcpyHostToDevice` — synchronous host DMA.
+    ///
+    /// Transfers larger than the device's per-transfer ceiling are split
+    /// automatically. The ceiling exists so the device never sizes a
+    /// buffer from an unbounded client-supplied length
+    /// (`types::MAX_DMA_BYTES`); chunking here is what keeps that limit
+    /// invisible to guests, exactly as real drivers hide DMA-ring
+    /// segmentation behind a single `cudaMemcpy`.
     pub fn memcpy_htod(&mut self, dst: DevicePtr, data: &[u8]) -> ShimResult<()> {
-        Ok(self.client.dma_write(self.vgpu, dst.0, data)?)
+        let chunk = MAX_DMA_BYTES as usize;
+        for (i, part) in data.chunks(chunk).enumerate() {
+            let at = dst.offset((i * chunk) as u64);
+            self.client.dma_write(self.vgpu, at.0, part)?;
+        }
+        Ok(())
     }
 
-    /// `cudaMemcpyDeviceToHost` — synchronous host DMA.
+    /// `cudaMemcpyDeviceToHost` — synchronous host DMA (chunked, as above).
     pub fn memcpy_dtoh(&mut self, src: DevicePtr, len: u64) -> ShimResult<Vec<u8>> {
-        Ok(self.client.dma_read(self.vgpu, src.0, len)?)
+        let mut out = Vec::with_capacity(len as usize);
+        let mut done = 0u64;
+        while done < len {
+            let take = MAX_DMA_BYTES.min(len - done);
+            out.extend_from_slice(&self.client.dma_read(self.vgpu, src.offset(done).0, take)?);
+            done += take;
+        }
+        Ok(out)
     }
 
     /// `cudaStreamCreate`: a new channel with an independent fence line.

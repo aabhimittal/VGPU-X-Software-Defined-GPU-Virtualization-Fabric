@@ -190,3 +190,71 @@ fn migrate_tenant_and_destroy_keep_the_registry_true() {
     na.shutdown();
     nb.shutdown();
 }
+
+/// **Registering a node is idempotent by address.** Two ids for one card
+/// would make the fabric believe it has twice the VRAM it has, and
+/// capacity that does not exist is worse than no capacity: every
+/// downstream decision is computed against a fiction that only surfaces
+/// as a mystifying admission failure at the node. Registration is exactly
+/// what gets retried by an operator or a config reload, so repeating it
+/// must be safe.
+#[test]
+fn registering_a_node_twice_does_not_invent_capacity() {
+    let n = spawn_node("a", 64);
+    let mut fabric = Fabric::new();
+    let first = fabric.add_node(n.addr).unwrap();
+    let again = fabric.add_node(n.addr).unwrap();
+    assert_eq!(first, again, "the same address is the same node");
+
+    let inv = fabric.inventory().unwrap();
+    assert_eq!(inv.len(), 1, "one card, one entry");
+    assert_eq!(inv[0].vram_bytes, 64 * FRAME_SIZE);
+
+    // And the capacity arithmetic stays honest end to end.
+    fabric.place(profile(32)).unwrap();
+    fabric.place(profile(32)).unwrap();
+    assert!(matches!(
+        fabric.place(profile(32)),
+        Err(FabricError::NoCapacity { .. })
+    ));
+    n.shutdown();
+}
+
+/// **A node's own refusal is not fleet-wide exhaustion.** The fabric
+/// reads capacity and *then* admits, so a node can change in between —
+/// another operator, a stale registry, a node restarted smaller. Whatever
+/// the cause, placement consults the rest of the ranking before declaring
+/// the fleet full, and only genuine exhaustion is reported as such.
+///
+/// (What this test can pin deterministically is the fall-through: the
+/// top-ranked candidate cannot host, and the tenant still lands. The
+/// concurrent-mutation race that motivates the retry is inherently
+/// timing-dependent and is deliberately not simulated here — asserting a
+/// race would make this suite flaky, which is worse than testing the
+/// property one level down.)
+#[test]
+fn placement_falls_through_when_the_best_candidate_cannot_host() {
+    let (na, nb) = (spawn_node("a", 64), spawn_node("b", 128));
+    let mut fabric = Fabric::new();
+    let a = fabric.add_node(na.addr).unwrap();
+    let b = fabric.add_node(nb.addr).unwrap();
+
+    // Someone outside the fabric consumes node a entirely, behind its back.
+    let mut interloper = VgpuClient::connect(na.addr).unwrap();
+    interloper.create_vgpu(profile(64)).unwrap();
+
+    // a is the tighter fit on paper but cannot host; b takes the tenant.
+    let placed = fabric.place(profile(64)).unwrap();
+    assert_eq!(placed.node, b);
+    assert_ne!(placed.node, a);
+
+    // b has 64 frames left, so one more fits...
+    assert_eq!(fabric.place(profile(64)).unwrap().node, b);
+    // ...and now the fleet really is full, reported honestly.
+    assert!(matches!(
+        fabric.place(profile(64)),
+        Err(FabricError::NoCapacity { .. })
+    ));
+    na.shutdown();
+    nb.shutdown();
+}

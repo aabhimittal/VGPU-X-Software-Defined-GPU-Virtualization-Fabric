@@ -23,10 +23,12 @@ use std::io::{self, Read, Write};
 /// History: v1 = milestone 1 (opaque-cost kernels); v2 = milestone 2
 /// (`KernelLaunch` carries threads/args/program, two new error variants);
 /// v3 = milestone 3 (five migration messages: profile fetch, allocation
-/// listing, dirty-page harvest, channel export/import).
+/// listing, dirty-page harvest, channel export/import); v4 = the
+/// hardening pass (two new error variants, `ChannelExport` carries the
+/// fence high-water mark).
 /// The command layout changed shape, so v1 peers must be refused — this
 /// bump is the versioning policy doing its job, not an inconvenience.
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 
 /// Upper bound on a frame body. Guards the daemon against a malicious or
 /// broken client sending a 4 GiB length prefix and OOMing the host — the
@@ -208,7 +210,25 @@ impl<'a> Dec<'a> {
 /// Write one frame: `[len: u32 LE][body]`. Flushes, because a frame is a
 /// request/response boundary and sitting in a BufWriter would deadlock
 /// both peers.
+///
+/// The size limit is enforced on the way *out*, not just on the way in.
+/// An asymmetric limit is a protocol bug waiting to happen: a peer that
+/// happily emits a 32 MiB frame its own reader would reject leaves the
+/// stream unreadable and unrecoverable — the receiver cannot skip a body
+/// it refused to size. Worse, `body.len() as u32` silently truncates
+/// past 4 GiB, which would frame the *wrong number of bytes* and
+/// desynchronize the connection permanently. Both are refused here, so
+/// every frame this codebase writes is one it could also read.
 pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
+    if body.len() > MAX_FRAME_LEN as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to emit a {} B frame: limit is {MAX_FRAME_LEN} B",
+                body.len()
+            ),
+        ));
+    }
     let len = body.len() as u32;
     w.write_all(&len.to_le_bytes())?;
     w.write_all(body)?;

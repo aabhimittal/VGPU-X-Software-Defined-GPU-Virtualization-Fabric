@@ -52,7 +52,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 
-use vgpu_core::types::VgpuId;
+use vgpu_core::types::{VgpuError, VgpuId};
 use vgpu_core::vgpu::VgpuProfile;
 use vgpu_proto::{migrate, ClientError, MigrateError, MigrateOptions, VgpuClient};
 
@@ -208,7 +208,20 @@ impl Fabric {
     /// our protocol (a `node_info` roundtrip) before admitting it to the
     /// pool — a fabric must never *discover* mid-placement that a node
     /// was never real.
+    ///
+    /// **Idempotent by address.** Registering the same node twice returns
+    /// the original id rather than minting a second one. Two ids for one
+    /// card would make the fabric believe it has twice the VRAM it has,
+    /// and capacity that does not exist is worse than no capacity: every
+    /// placement decision downstream is computed against a fiction, and
+    /// the lie only surfaces as a mysterious admission failure at the
+    /// node. Registration is exactly the kind of operation that gets
+    /// retried by an operator or a config reload, so it must be safe to
+    /// repeat.
     pub fn add_node(&mut self, addr: SocketAddr) -> FabricResult<NodeId> {
+        if let Some((id, _)) = self.nodes.iter().find(|(_, n)| n.addr == addr) {
+            return Ok(*id);
+        }
         self.connect(addr)?.node_info()?;
         let id = NodeId(self.next_node);
         self.next_node += 1;
@@ -251,12 +264,35 @@ impl Fabric {
     /// optimal — bin packing is NP-hard — but it is the classic
     /// good-and-explainable answer, and profiles make even the greedy
     /// rule effective.)
+    /// Placement re-tries down the ranking when a node refuses the twin.
+    /// The fabric reads capacity and *then* admits, and between those two
+    /// steps the node is free to change: another operator, a leftover
+    /// client, a node restarted with a smaller card. Treating the first
+    /// candidate's refusal as fleet-wide exhaustion would strand a tenant
+    /// while capacity sat one node over. Nodes that reject are skipped,
+    /// and only genuine exhaustion is reported.
     pub fn place(&mut self, profile: VgpuProfile) -> FabricResult<TenantHandle> {
-        let node = self.best_fit(profile.vram_bytes, None)?;
-        let addr = self.nodes[&node].addr;
-        let mut client = self.connect(addr)?;
-        let vgpu = client.create_vgpu(profile.clone())?;
-        client.start_vgpu(vgpu)?;
+        let mut refused: Vec<NodeId> = Vec::new();
+        let (node, addr, vgpu) = loop {
+            let node = self
+                .best_fit(profile.vram_bytes, None, &refused)
+                .map_err(|e| self.exhausted(e, &refused, profile.vram_bytes))?;
+            let addr = self.nodes[&node].addr;
+            let mut client = self.connect(addr)?;
+            match client.create_vgpu(profile.clone()) {
+                Ok(vgpu) => {
+                    client.start_vgpu(vgpu)?;
+                    break (node, addr, vgpu);
+                }
+                // The node knows its own capacity better than our reading
+                // of it did; believe the node and try the next candidate.
+                Err(ClientError::Device(VgpuError::ProfileUnsatisfiable { .. }))
+                | Err(ClientError::Device(VgpuError::OutOfVram { .. })) => {
+                    refused.push(node);
+                }
+                Err(e) => return Err(FabricError::Client(e)),
+            }
+        };
 
         let tenant = TenantId(self.next_tenant);
         self.next_tenant += 1;
@@ -351,7 +387,7 @@ impl Fabric {
         for tenant in residents {
             let bytes = self.tenants[&tenant].profile.vram_bytes;
             let dest = self
-                .best_fit(bytes, Some(node))
+                .best_fit(bytes, Some(node), &[])
                 .map_err(|_| FabricError::NoDestination)?;
             self.migrate_tenant(tenant, dest)?;
             moved += 1;
@@ -359,15 +395,33 @@ impl Fabric {
         Ok(moved)
     }
 
+    /// Keep the most informative error when every candidate is gone: if
+    /// nodes refused us, that is the real story, not "no capacity".
+    fn exhausted(&self, e: FabricError, refused: &[NodeId], bytes: u64) -> FabricError {
+        if refused.is_empty() {
+            e
+        } else {
+            FabricError::NoCapacity {
+                requested: bytes,
+                best_available: 0,
+            }
+        }
+    }
+
     /// Best-fit selection over live capacity, optionally excluding one
-    /// node (the one being drained).
-    fn best_fit(&mut self, bytes: u64, exclude: Option<NodeId>) -> FabricResult<NodeId> {
+    /// node (the one being drained) plus any that already refused.
+    fn best_fit(
+        &mut self,
+        bytes: u64,
+        exclude: Option<NodeId>,
+        refused: &[NodeId],
+    ) -> FabricResult<NodeId> {
         let mut best: Option<(u64, NodeId)> = None; // (slack, node)
         let mut best_available = 0u64;
         let candidates: Vec<(NodeId, SocketAddr)> = self
             .nodes
             .iter()
-            .filter(|(id, _)| Some(**id) != exclude)
+            .filter(|(id, _)| Some(**id) != exclude && !refused.contains(id))
             .map(|(id, n)| (*id, n.addr))
             .collect();
         for (id, addr) in candidates {

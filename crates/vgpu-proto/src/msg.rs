@@ -422,6 +422,7 @@ fn enc_channel_export(e: &mut Enc, ch: &ChannelExport) {
         enc_command(e, cmd);
     }
     e.u64(ch.completed_fence);
+    e.u64(ch.submitted_fence);
     e.bool(ch.faulted);
 }
 
@@ -434,6 +435,7 @@ fn dec_channel_export(d: &mut Dec) -> Result<ChannelExport, WireError> {
     Ok(ChannelExport {
         pending,
         completed_fence: d.u64()?,
+        submitted_fence: d.u64()?,
         faulted: d.bool()?,
     })
 }
@@ -522,6 +524,16 @@ fn enc_error(e: &mut Enc, err: &VgpuError) {
             e.u8(14);
             e.u64(*executed);
         }
+        VgpuError::TransferTooLarge { requested, limit } => {
+            e.u8(15);
+            e.u64(*requested);
+            e.u64(*limit);
+        }
+        VgpuError::FenceRegression { last, attempted } => {
+            e.u8(16);
+            e.u64(*last);
+            e.u64(*attempted);
+        }
     }
 }
 
@@ -560,6 +572,14 @@ fn dec_error(d: &mut Dec) -> Result<VgpuError, WireError> {
         12 => VgpuError::ChannelFaulted(ChannelId(d.u32()?)),
         13 => VgpuError::BadProgram { why: d.str()? },
         14 => VgpuError::KernelTimeout { executed: d.u64()? },
+        15 => VgpuError::TransferTooLarge {
+            requested: d.u64()?,
+            limit: d.u64()?,
+        },
+        16 => VgpuError::FenceRegression {
+            last: d.u64()?,
+            attempted: d.u64()?,
+        },
         tag => {
             return Err(WireError::BadTag {
                 context: "VgpuError",
@@ -1056,6 +1076,7 @@ mod tests {
                     Command::FenceSignal { value: 5 },
                 ],
                 completed_fence: 4,
+                submitted_fence: 5,
                 faulted: false,
             }],
         });
@@ -1118,6 +1139,7 @@ mod tests {
         roundtrip_resp(Response::Channels(vec![ChannelExport {
             pending: vec![Command::FenceSignal { value: 9 }],
             completed_fence: 8,
+            submitted_fence: 8,
             faulted: true,
         }]));
     }

@@ -4,6 +4,7 @@
 
 use vgpu_core::isa::busy;
 use vgpu_core::prelude::*;
+use vgpu_core::types::MAX_DMA_BYTES;
 
 fn node() -> GpuNode {
     GpuNode::new(PhysGpuConfig {
@@ -424,4 +425,164 @@ fn stop_and_copy_migration_between_nodes() {
     assert_eq!(dst.fence_value(twin, ch).unwrap(), 2);
     dst.dma_read(twin, b, &mut check).unwrap();
     assert_eq!(&check, b"payload before migration");
+}
+
+// ---------------------------------------------------------------------------
+// Industrial edge cases. Each test below is a bug that was found by
+// probing the built system rather than by reading it, and each states the
+// invariant that bug violated. See `docs/10-industrial-edge-cases.md`.
+// ---------------------------------------------------------------------------
+
+/// **A cheap fault must not steal the node.** One command that fails
+/// instantly does no work, so it must not be *charged* for work: billing
+/// a faulting command its nominal cost lets a tenant name an enormous
+/// length, fail immediately, and consume the entire scheduling window —
+/// delivering zero cycles to everyone else. This is the fairness claim in
+/// the README, tested against a hostile submitter rather than a polite one.
+#[test]
+fn a_cheap_fault_cannot_starve_the_node() {
+    let mut node = node();
+    let hostile = node.create_vgpu(profile("hostile", 32, 1)).unwrap();
+    let victim = node.create_vgpu(profile("victim", 32, 1)).unwrap();
+    node.start_vgpu(hostile).unwrap();
+    node.start_vgpu(victim).unwrap();
+    let ch_h = node.create_channel(hostile).unwrap();
+    let ch_v = node.create_channel(victim).unwrap();
+
+    // Nominal cost ~5.7e17 cycles; actual work done: none. It faults on
+    // translation because nothing is mapped at VA 0.
+    node.submit(
+        hostile,
+        ch_h,
+        Command::MemFill {
+            dst: GpuVirtAddr(0),
+            len: u64::MAX / 2,
+            value: 1,
+        },
+    )
+    .unwrap();
+    for i in 1..=10u64 {
+        node.submit(victim, ch_v, Command::FenceSignal { value: i })
+            .unwrap();
+    }
+
+    let report = node.tick(10_000);
+    assert_eq!(report.faults.len(), 1, "the hostile command faulted");
+    assert!(
+        node.consumed(hostile) < 100,
+        "a fault costs a page walk, not the transfer it never made (got {})",
+        node.consumed(hostile)
+    );
+    assert_eq!(
+        node.fence_value(victim, ch_v).unwrap(),
+        10,
+        "the innocent neighbour's work must still run to completion"
+    );
+}
+
+/// **Fences are a monotonic clock.** Every waiter reasons "fence >= N
+/// implies prior work completed", so a value that would move the fence
+/// backwards is refused at the doorbell — before it can make a satisfied
+/// wait look unsatisfied, or a later wait return against a stale value.
+#[test]
+fn fence_values_cannot_move_backwards() {
+    let mut node = node();
+    let t = node.create_vgpu(profile("t", 32, 1)).unwrap();
+    node.start_vgpu(t).unwrap();
+    let ch = node.create_channel(t).unwrap();
+
+    node.submit(t, ch, Command::FenceSignal { value: 5 })
+        .unwrap();
+    node.tick(1_000);
+    assert_eq!(node.fence_value(t, ch).unwrap(), 5);
+
+    // Backwards and equal are both refused, with the numbers attached.
+    assert!(matches!(
+        node.submit(t, ch, Command::FenceSignal { value: 1 }),
+        Err(VgpuError::FenceRegression {
+            last: 5,
+            attempted: 1
+        })
+    ));
+    assert!(matches!(
+        node.submit(t, ch, Command::FenceSignal { value: 5 }),
+        Err(VgpuError::FenceRegression { .. })
+    ));
+    // Forward still works, and the clock is judged against what is
+    // *queued*, not what has run: two unexecuted fences must still order.
+    node.submit(t, ch, Command::FenceSignal { value: 6 })
+        .unwrap();
+    assert!(matches!(
+        node.submit(t, ch, Command::FenceSignal { value: 6 }),
+        Err(VgpuError::FenceRegression { .. })
+    ));
+    node.submit(t, ch, Command::FenceSignal { value: 7 })
+        .unwrap();
+    node.tick(1_000);
+    assert_eq!(node.fence_value(t, ch).unwrap(), 7);
+}
+
+/// **Host transfers are bounded by the device, not by the caller.** The
+/// length of a DMA arrives from a client; the device refuses oversized
+/// ones with a typed error *before* anything is sized from that number.
+#[test]
+fn oversized_transfers_are_refused_with_their_numbers() {
+    let mut node = node();
+    let t = node.create_vgpu(profile("t", 32, 1)).unwrap();
+    node.start_vgpu(t).unwrap();
+    let buf = node.alloc_memory(t, FRAME_SIZE).unwrap();
+
+    let mut huge = vec![0u8; (MAX_DMA_BYTES + 1) as usize];
+    assert!(matches!(
+        node.dma_read(t, buf, &mut huge),
+        Err(VgpuError::TransferTooLarge { limit, .. }) if limit == MAX_DMA_BYTES
+    ));
+    assert!(matches!(
+        node.dma_write(t, buf, &huge),
+        Err(VgpuError::TransferTooLarge { .. })
+    ));
+    // At the limit exactly, the size is fine — it is the mapping that
+    // decides, which is the ordinary page-fault path.
+    let at_limit = vec![0u8; MAX_DMA_BYTES as usize];
+    assert!(matches!(
+        node.dma_write(t, buf, &at_limit),
+        Err(VgpuError::PageFault { .. })
+    ));
+}
+
+/// **A migrated channel keeps refusing rewinds.** The fence high-water
+/// mark travels with the channel; otherwise a guest could rewind its own
+/// completion clock simply by being migrated.
+#[test]
+fn fence_monotonicity_survives_migration() {
+    let mut src = node();
+    let mut dst = GpuNode::new(PhysGpuConfig {
+        name: "dst".to_string(),
+        vram_bytes: 256 * FRAME_SIZE,
+        slice_cycles: 100,
+    });
+
+    let t = src.create_vgpu(profile("t", 32, 1)).unwrap();
+    src.start_vgpu(t).unwrap();
+    let ch = src.create_channel(t).unwrap();
+    src.submit(t, ch, Command::FenceSignal { value: 9 })
+        .unwrap();
+    src.tick(1_000);
+
+    src.suspend_vgpu(t).unwrap();
+    let twin = dst.create_vgpu(src.vgpu_profile(t).unwrap()).unwrap();
+    dst.import_channels(twin, src.export_channels(t).unwrap())
+        .unwrap();
+    dst.start_vgpu(twin).unwrap();
+
+    assert_eq!(dst.fence_value(twin, ch).unwrap(), 9);
+    assert!(
+        matches!(
+            dst.submit(twin, ch, Command::FenceSignal { value: 4 }),
+            Err(VgpuError::FenceRegression { last: 9, .. })
+        ),
+        "the destination must refuse what the source would have refused"
+    );
+    dst.submit(twin, ch, Command::FenceSignal { value: 10 })
+        .unwrap();
 }

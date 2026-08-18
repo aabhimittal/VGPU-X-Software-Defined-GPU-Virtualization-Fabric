@@ -395,17 +395,27 @@ impl Vgpu {
         self.aspace.take_dirty()
     }
 
-    /// Export all channels' migratable state. Requires Suspended: only a
-    /// frozen vGPU's rings are a closed set, which is exactly why the
-    /// state machine has carried `Suspended` since milestone 0.
+    /// Export all channels' migratable state.
+    ///
+    /// The precondition is *the rings cannot change*, and two states give
+    /// that: `Suspended` (frozen mid-life) and `Created` (never started,
+    /// so it has no channels and cannot accept submissions). Naming the
+    /// property rather than one state that implies it is what keeps a
+    /// merely-placed tenant movable — the alternative silently makes the
+    /// tenants an operator is most likely to relocate the ones that
+    /// cannot be.
     pub fn export_channels(&self) -> Result<Vec<crate::cmd::ChannelExport>> {
-        self.expect_state("export_channels", &[VgpuState::Suspended])?;
+        self.expect_state(
+            "export_channels",
+            &[VgpuState::Suspended, VgpuState::Created],
+        )?;
         Ok(self
             .channels
             .iter()
             .map(|ch| crate::cmd::ChannelExport {
                 pending: ch.ring.iter_pending().cloned().collect(),
                 completed_fence: ch.completed_fence,
+                submitted_fence: ch.submitted_fence,
                 faulted: ch.state == ChannelState::Faulted,
             })
             .collect())
@@ -437,6 +447,11 @@ impl Vgpu {
                 channel.ring.push(cmd)?;
             }
             channel.completed_fence = export.completed_fence;
+            // Restore the fence clock *after* replaying pending commands:
+            // pushing them directly onto the ring above bypasses submit's
+            // monotonicity check (they already passed it on the source),
+            // so the high-water mark is set from the export, not derived.
+            channel.submitted_fence = export.submitted_fence.max(export.completed_fence);
             if export.faulted {
                 channel.state = ChannelState::Faulted;
             }
