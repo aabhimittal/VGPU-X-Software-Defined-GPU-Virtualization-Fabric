@@ -213,6 +213,13 @@ pub struct ChannelExport {
     pub pending: Vec<Command>,
     /// Last fence value signaled to the guest.
     pub completed_fence: u64,
+    /// Highest fence value ever *submitted* on this channel (>= the
+    /// completed one, since queued fences have not signaled yet).
+    /// Carried across migration so the monotonicity rule survives the
+    /// move: a channel that has promised fence 9 must keep refusing 9 on
+    /// its new node, or a guest could rewind its own completion clock by
+    /// migrating.
+    pub submitted_fence: u64,
     /// True if the channel had been killed by a fault (a dead channel
     /// migrates as dead — migration must not resurrect it).
     pub faulted: bool,
@@ -232,6 +239,12 @@ pub struct Channel {
     /// Last fence value the device has signaled (guest-visible completion
     /// state; starts at 0, so guests use values >= 1).
     pub completed_fence: u64,
+    /// Highest fence value accepted at submit. Tracked separately from
+    /// `completed_fence` because monotonicity must be judged against
+    /// what is *queued*, not what has run: two fences sitting in the
+    /// ring have not signaled yet, and the second must still be greater
+    /// than the first.
+    pub submitted_fence: u64,
     /// Active or dead.
     pub state: ChannelState,
     /// The fault that killed the channel, kept for the host-side record.
@@ -245,17 +258,46 @@ impl Channel {
             id,
             ring: Ring::new(ring_capacity),
             completed_fence: 0,
+            submitted_fence: 0,
             state: ChannelState::Active,
             fault: None,
         }
     }
 
-    /// Guest-facing submit: refuse work on a dead channel, else ring push.
+    /// Guest-facing submit: refuse work on a dead channel, enforce the
+    /// fence clock's monotonicity, else ring push.
+    ///
+    /// Rejecting a non-increasing fence is not pedantry. Every waiter in
+    /// the stack — `vgpu_shim`'s `synchronize`, any guest polling a fence
+    /// — reasons "fence >= N implies everything submitted before N has
+    /// completed". A guest that signals 5 and then 1 makes the channel's
+    /// completion clock run *backwards*, and a waiter blocked on 3 that
+    /// had already been satisfied would, after the rewind, see an
+    /// unsatisfied fence — or worse, a *later* wait for 3 returns
+    /// immediately against the stale 5. Hardware fence/timeline
+    /// semaphores are monotonic for exactly this reason; the device is
+    /// the only place that can enforce it, so it does.
     pub fn submit(&mut self, cmd: Command) -> Result<()> {
         if self.state == ChannelState::Faulted {
             return Err(VgpuError::ChannelFaulted(self.id));
         }
-        self.ring.push(cmd)
+        let fence = match &cmd {
+            Command::FenceSignal { value } if *value <= self.submitted_fence => {
+                return Err(VgpuError::FenceRegression {
+                    last: self.submitted_fence,
+                    attempted: *value,
+                })
+            }
+            Command::FenceSignal { value } => Some(*value),
+            _ => None,
+        };
+        self.ring.push(cmd)?;
+        // Advanced only after the push succeeded: a command rejected by a
+        // full ring must not move a clock it never joined.
+        if let Some(value) = fence {
+            self.submitted_fence = value;
+        }
+        Ok(())
     }
 
     /// Device-facing: mark the channel dead after a fault.

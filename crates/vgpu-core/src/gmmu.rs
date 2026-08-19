@@ -287,6 +287,9 @@ impl AddressSpace {
     /// translated); an unmapped page here is an engine bug, hence
     /// `debug_assert`, not `Err`.
     pub fn mark_dirty_range(&mut self, addr: GpuVirtAddr, len: u64) {
+        if len == 0 {
+            return; // a zero-byte write dirties nothing
+        }
         let mut cur = addr.0 - addr.frame_offset(); // round down to page
         let end = addr.0.saturating_add(len);
         while cur < end {

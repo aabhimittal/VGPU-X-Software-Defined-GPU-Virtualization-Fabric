@@ -74,6 +74,23 @@ pub struct FrameNum(pub u64);
 /// once, not one.
 pub const FRAME_SIZE: u64 = 64 * 1024;
 
+/// Largest single host-DMA transfer the device accepts, in bytes.
+///
+/// Guest-facing operations that carry a payload must have a *bound* the
+/// device enforces itself. Without one, `DmaRead { len }` is an
+/// attacker-controlled allocation on the host serving every tenant: the
+/// daemon would size a buffer from a number a client chose, and a large
+/// enough number aborts the process — taking every co-tenant with it.
+/// The rule this encodes is general: **never size a host allocation from
+/// an untrusted number without a ceiling.**
+///
+/// 8 MiB sits safely under the wire's 16 MiB frame limit, leaving room
+/// for framing overhead, so a transfer the device accepts is always a
+/// response the peer can actually read. Larger guest transfers are
+/// chunked client-side (see `vgpu_shim`), which is what real drivers do
+/// with DMA rings anyway.
+pub const MAX_DMA_BYTES: u64 = 8 * 1024 * 1024;
+
 impl GpuVirtAddr {
     /// Byte offset within the containing frame (the low 16 bits for 64 KiB
     /// frames).
@@ -204,6 +221,26 @@ pub enum VgpuError {
         /// Instructions executed before the watchdog fired.
         executed: u64,
     },
+    /// A single host-DMA transfer exceeded `MAX_DMA_BYTES`. Refused
+    /// *before* any buffer is sized, because the length came from a
+    /// client.
+    TransferTooLarge {
+        /// Bytes the caller asked for.
+        requested: u64,
+        /// The device's per-transfer ceiling.
+        limit: u64,
+    },
+    /// A `FenceSignal` would move a channel's fence backwards (or repeat
+    /// a value). Fences are a monotonic completion clock: every consumer
+    /// reasons "fence >= N means everything submitted before N is done",
+    /// so a regression silently breaks every waiter on the channel.
+    /// Rejected at the doorbell, where the guest still learns about it.
+    FenceRegression {
+        /// Highest value already submitted on this channel.
+        last: u64,
+        /// The offending value.
+        attempted: u64,
+    },
 }
 
 /// Whether a faulting access was a read or a write — reported in the fault
@@ -252,6 +289,14 @@ impl fmt::Display for VgpuError {
             Self::KernelTimeout { executed } => {
                 write!(f, "kernel watchdog fired after {executed} instructions")
             }
+            Self::TransferTooLarge { requested, limit } => write!(
+                f,
+                "transfer of {requested} B exceeds the {limit} B per-transfer limit"
+            ),
+            Self::FenceRegression { last, attempted } => write!(
+                f,
+                "fence must increase: last signaled {last}, attempted {attempted}"
+            ),
         }
     }
 }

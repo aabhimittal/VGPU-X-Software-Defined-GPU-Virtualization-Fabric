@@ -230,10 +230,19 @@ fn handle(node: &mut GpuNode, req: Request) -> Response {
             map(node.dma_write(vgpu, dst, &data), |()| Response::Done)
         }
         Request::DmaRead { vgpu, src, len } => {
-            let mut buf = vec![0u8; len as usize];
-            map(node.dma_read(vgpu, src, &mut buf), move |()| {
-                Response::Data(buf)
-            })
+            // Validate the length BEFORE sizing anything with it. `len`
+            // came off a socket; `vec![0; len]` on an unbounded value is
+            // an abort of the process serving every tenant on this node.
+            // This ordering is the whole fix — see `check_transfer_len`.
+            match vgpu_core::node::check_transfer_len(len) {
+                Err(e) => Response::Error(e),
+                Ok(()) => {
+                    let mut buf = vec![0u8; len as usize];
+                    map(node.dma_read(vgpu, src, &mut buf), move |()| {
+                        Response::Data(buf)
+                    })
+                }
+            }
         }
         Request::VgpuState(id) => map(node.vgpu_state(id), Response::State),
         Request::Tick { budget } => {
@@ -252,6 +261,11 @@ fn handle(node: &mut GpuNode, req: Request) -> Response {
         Request::ExportChannels(id) => map(node.export_channels(id), Response::Channels),
         Request::ImportChannels { vgpu, channels } => {
             map(node.import_channels(vgpu, channels), |()| Response::Done)
+        }
+        Request::GetMetrics => Response::Metrics(node.metrics()),
+        Request::GetQosWindow(id) => Response::QosWindow(node.window_consumed(id)),
+        Request::AdoptQosWindow { vgpu, consumed } => {
+            map(node.adopt_qos_window(vgpu, consumed), |()| Response::Done)
         }
         Request::AllocMemoryAt { vgpu, base, bytes } => {
             map(node.alloc_memory_at(vgpu, base, bytes), Response::Memory)

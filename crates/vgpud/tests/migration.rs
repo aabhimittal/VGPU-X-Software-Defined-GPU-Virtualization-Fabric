@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 
 use vgpu_core::cmd::Command;
 use vgpu_core::node::PhysGpuConfig;
+use vgpu_core::sched::QosLimits;
 use vgpu_core::types::{GpuVirtAddr, VgpuError, FRAME_SIZE};
 use vgpu_core::vgpu::{VgpuProfile, VgpuState};
 use vgpu_proto::{migrate, ClientError, MigrateOptions, VgpuClient};
@@ -34,6 +35,7 @@ fn profile(frames: u64) -> VgpuProfile {
         compute_weight: 1,
         max_channels: 4,
         ring_slots: 256,
+        qos: QosLimits::default(),
     }
 }
 

@@ -18,11 +18,13 @@
 //! exactly (`Dec::finish`), and the daemon never trusts a length it read
 //! from a socket.
 
+pub mod checkpoint;
 pub mod client;
 pub mod migrate;
 pub mod msg;
 pub mod wire;
 
+pub use checkpoint::{checkpoint, clone_tenant, restore, Checkpoint};
 pub use client::{ClientError, ClientResult, VgpuClient};
 pub use migrate::{migrate, MigrateError, MigrateOptions};
 pub use msg::{FaultSummary, NodeInfo, Request, Response, TickSummary};

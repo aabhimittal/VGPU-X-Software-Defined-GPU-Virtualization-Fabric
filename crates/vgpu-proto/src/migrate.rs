@@ -39,18 +39,47 @@
 //! node's *other* tenants, so a migrated vGPU joins the destination at
 //! its high-water mark like any new arrival (see `sched::register`).
 //!
-//! # Structure drift
+//! The QoS *window* spend, by contrast, does migrate — and the contrast
+//! is the point. A weight is relative, so importing one would be
+//! meaningless; a cap is absolute ("never more than 25%") and means the
+//! same thing on every card in the fleet. Dropping it would let a tenant
+//! migrated once per window collect its ceiling twice, which is a
+//! contract violation rather than a fairness wobble. Deciding *per piece
+//! of state* whether it is relative or absolute is the whole question a
+//! migration has to answer.
 //!
-//! The guest may `malloc`/`free` *during* step 3 — the allocation list
-//! replayed in step 2 can be stale by step 4. After suspending, the
-//! driver re-lists allocations; on drift it rebuilds the twin's structure
-//! from the frozen truth and full-copies (the source is suspended, so
-//! this is final and correct — it just forfeits pre-copy's shorter
-//! brownout for that unlucky migration).
+//! # Structure drift: the guest keeps allocating while you copy
+//!
+//! "Live" means the guest is *running*, and a running guest allocates
+//! and frees. So the allocation list replayed in step 2 goes stale
+//! mid-flight, and this is the normal case, not an exotic one.
+//!
+//! It bites in a specific way that a first implementation gets wrong:
+//! new pages are born dirty, so step 3's `take_dirty` hands back pages
+//! belonging to allocations the twin *does not have yet*, and copying
+//! them page-faults the destination. Left unhandled, the most ordinary
+//! thing a live guest can do — call `malloc` — fails the entire
+//! migration. The rule worth extracting: **a pre-copy round must be
+//! tolerant of the structure changing underneath it, because that is the
+//! only condition under which it ever runs.**
+//!
+//! So the loop copies only the dirty pages that fall inside the replayed
+//! structure, and defers the rest. After the suspend the driver re-lists
+//! against the now-frozen truth; on drift it rebuilds the twin and
+//! full-copies. Correct always, fast in the common case — the standard
+//! shape for optimistic protocols.
 
 use vgpu_core::types::{GpuVirtAddr, VgpuId, FRAME_SIZE};
+use vgpu_core::vgpu::VgpuState;
 
 use crate::client::{ClientError, VgpuClient};
+
+/// Is this page inside one of the allocations we replayed on the twin?
+fn covered_by(allocs: &[(GpuVirtAddr, u64)], page: GpuVirtAddr) -> bool {
+    allocs
+        .iter()
+        .any(|(base, bytes)| page.0 >= base.0 && page.0 < base.0 + bytes)
+}
 
 /// Tuning knobs for the pre-copy loop.
 #[derive(Debug, Clone)]
@@ -129,8 +158,22 @@ fn migrate_inner(
 
     // (3) Live pre-copy rounds. Round 1's take_dirty returns every mapped
     // page (pages are born dirty), so the first round IS the bulk copy.
+    //
+    // Pages outside the replayed structure belong to allocations the
+    // guest made after step 2 and the twin therefore lacks; copying them
+    // now would fault the destination. They are skipped here and picked
+    // up by the post-suspend drift path, which rebuilds against frozen
+    // truth. Dropping them from *this* round is safe precisely because
+    // that later pass is unconditional.
     for _ in 0..opts.max_precopy_rounds {
-        let dirty = src.take_dirty(vgpu)?;
+        let harvested = src.take_dirty(vgpu)?;
+        if harvested.is_empty() {
+            break;
+        }
+        let dirty: Vec<GpuVirtAddr> = harvested
+            .into_iter()
+            .filter(|p| covered_by(&allocs, *p))
+            .collect();
         if dirty.is_empty() {
             break;
         }
@@ -141,7 +184,16 @@ fn migrate_inner(
     }
 
     // (4) Brownout begins: freeze the source.
-    src.suspend_vgpu(vgpu)?;
+    //
+    // A vGPU that is already Suspended (an operator froze it, or a
+    // previous attempt got this far) or still Created (placed but never
+    // started) is *already* the closed set the copy needs. Demanding
+    // Running would make those tenants unmovable for no reason —
+    // migration should care that the source cannot change, not how it
+    // came to be that way.
+    if src.vgpu_state(vgpu)? == VgpuState::Running {
+        src.suspend_vgpu(vgpu)?;
+    }
 
     // (4b) Structure drift check against the now-frozen truth.
     let frozen = src.list_allocations(vgpu)?;
@@ -164,9 +216,21 @@ fn migrate_inner(
         copy_pages(src, dst, vgpu, twin, &dirty)?;
     }
 
-    // (6) In-flight work and guest-visible completion state.
+    // (6) In-flight work and guest-visible completion state (including
+    // the fence high-water mark, so the destination keeps refusing
+    // rewinds the source would have refused).
     let channels = src.export_channels(vgpu)?;
     dst.import_channels(twin, channels)?;
+
+    // (6b) Carry the QoS window spend. A cap is an *absolute* promise
+    // ("never more than 25%"), so it must survive a move — unlike
+    // vruntime, which is meaningful only against a node's other tenants
+    // and is deliberately dropped. Without this, a tenant migrated once
+    // per window would collect its ceiling twice.
+    let spent = src.qos_window(vgpu)?;
+    if spent > 0 {
+        dst.adopt_qos_window(twin, spent)?;
+    }
 
     // (7) Flip: twin goes live, source ceases to exist.
     dst.start_vgpu(twin)?;

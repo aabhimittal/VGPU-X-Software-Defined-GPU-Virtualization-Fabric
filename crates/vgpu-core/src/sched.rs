@@ -22,6 +22,33 @@
 //! "the scheduler equalizes vruntime" — there is no ratio bookkeeping
 //! anywhere, which is why the technique generalizes so well.
 //!
+//! # Weights alone cannot express what operators sell
+//!
+//! Proportional share answers "who gets the GPU *now*", and that is the
+//! only question a fair scheduler asks. Two questions operators ask
+//! constantly are not expressible in weights at all:
+//!
+//! * **"This tenant must never exceed 25%, even on an idle GPU."** A
+//!   weight cannot say this: weights only bind under contention, so a
+//!   weight-1 tenant alone on the card gets 100%. But a customer who
+//!   bought a quarter card and sees full-card performance at 3am will
+//!   file a bug when their neighbours arrive and it halves — and worse,
+//!   *the vendor cannot reproduce it*, because performance now depends
+//!   on who else is running. A hard cap trades throughput for the thing
+//!   tenants actually want from a tier: **predictability**. NVIDIA ships
+//!   exactly this as its "fixed share" scheduler, opposite "best effort".
+//! * **"This tenant is guaranteed 30% under any contention."** Weights
+//!   give a *ratio*, and a ratio's floor collapses as tenants arrive: a
+//!   weight-3 tenant holds 75% against one weight-1 neighbour and 23%
+//!   against nine. An SLA is an absolute floor, so it needs one.
+//!
+//! Both are enforced over a sliding window of `QOS_WINDOW_CYCLES`, which
+//! is what makes them checkable at all — an instantaneous "share" is not
+//! a measurable quantity. Caps and reservations are opt-in per profile;
+//! a profile that sets neither behaves exactly as it did before they
+//! existed, which is why every fairness test from milestone 0 still
+//! passes unchanged.
+//!
 //! # The sleeper problem
 //!
 //! A tenant idle for a million cycles keeps an ancient (tiny) vruntime; if
@@ -35,11 +62,40 @@ use std::collections::HashMap;
 
 use crate::types::{Cycles, VgpuId};
 
+/// Length of the accounting window for caps and reservations.
+///
+/// A "share" is only meaningful over an interval, so this constant is
+/// the interval. The trade is the usual one for any windowed limiter:
+/// shorter windows enforce tightly but let a tenant with bursty demand
+/// lose cycles it could have used; longer windows tolerate bursts but
+/// let a capped tenant monopolize the early part of a window. 100k
+/// cycles is ~1000 default slices — long enough that scheduling noise
+/// averages out, short enough that a cap is felt promptly.
+pub const QOS_WINDOW_CYCLES: Cycles = 100_000;
+
 /// Fixed-point scale for vruntime so integer division by weight keeps
 /// precision (CFS does the same with `NICE_0_LOAD` = 1024). vruntime is
 /// u128: worst case is `cycles * SCALE` with weight 1, and 2^64 cycles
 /// * 2^10 needs headroom beyond u64.
 const SCALE: u128 = 1024;
+
+/// Optional per-tenant quality-of-service limits, both expressed as a
+/// percentage of the GPU over one `QOS_WINDOW_CYCLES` window.
+///
+/// `None` for both means "pure proportional share" — the milestone-0
+/// behaviour, and still the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QosLimits {
+    /// Hard ceiling: the tenant is skipped once it has taken this share
+    /// of the current window, *even if the GPU would otherwise idle*.
+    /// Buys predictability at the cost of throughput.
+    pub max_share_pct: Option<u32>,
+    /// Guaranteed floor under contention: while the tenant is below this
+    /// share of the window it is scheduled ahead of tenants that are not.
+    /// Admission control refuses profiles whose floors would sum past
+    /// 100% — a guarantee the node cannot keep must never be sold.
+    pub min_share_pct: Option<u32>,
+}
 
 #[derive(Debug)]
 struct Account {
@@ -49,6 +105,9 @@ struct Account {
     /// Unweighted total, for metrics and fairness assertions in tests.
     consumed: Cycles,
     runnable: bool,
+    qos: QosLimits,
+    /// Cycles taken inside the current QoS window.
+    window_consumed: Cycles,
 }
 
 /// The per-node scheduler. It knows nothing about commands or memory —
@@ -60,6 +119,13 @@ pub struct Scheduler {
     /// High-water mark: the largest vruntime any tenant has been *picked
     /// at*. Monotonic. Used only to clamp wakers (see module docs).
     min_vruntime: u128,
+    /// Cycles accounted in the current QoS window, including cycles the
+    /// GPU spent *idle* because every runnable tenant was capped out.
+    /// Counting forced idleness is what makes a cap a cap: if the window
+    /// only advanced when work ran, a capped-out tenant alone on the card
+    /// would stall the window and then be handed a fresh budget with no
+    /// time having passed — a limiter that limits nothing.
+    window_used: Cycles,
 }
 
 impl Scheduler {
@@ -68,6 +134,7 @@ impl Scheduler {
         Self {
             accounts: HashMap::new(),
             min_vruntime: 0,
+            window_used: 0,
         }
     }
 
@@ -75,6 +142,11 @@ impl Scheduler {
     /// zero — joining the node must not grant a retroactive cycle debt
     /// against incumbents (same clamp as waking, for the same reason).
     pub fn register(&mut self, id: VgpuId, weight: u32) {
+        self.register_with_qos(id, weight, QosLimits::default());
+    }
+
+    /// Register a tenant carrying QoS limits.
+    pub fn register_with_qos(&mut self, id: VgpuId, weight: u32, qos: QosLimits) {
         debug_assert!(weight > 0, "profile validation guarantees weight > 0");
         self.accounts.insert(
             id,
@@ -83,8 +155,62 @@ impl Scheduler {
                 vruntime: self.min_vruntime,
                 consumed: 0,
                 runnable: false,
+                qos,
+                window_consumed: 0,
             },
         );
+    }
+
+    /// Share of one window, in cycles, for a percentage.
+    fn window_share(pct: u32) -> Cycles {
+        QOS_WINDOW_CYCLES * pct as u64 / 100
+    }
+
+    /// Has this tenant spent its ceiling for the current window?
+    fn capped_out(acc: &Account) -> bool {
+        acc.qos
+            .max_share_pct
+            .is_some_and(|pct| acc.window_consumed >= Self::window_share(pct))
+    }
+
+    /// Is this tenant still below its guaranteed floor?
+    fn under_floor(acc: &Account) -> bool {
+        acc.qos
+            .min_share_pct
+            .is_some_and(|pct| acc.window_consumed < Self::window_share(pct))
+    }
+
+    /// True when work is queued but every runnable tenant has spent its
+    /// cap. The caller (the tick loop) must then let the GPU idle and
+    /// tell the scheduler how long, via `advance_idle` — cap-induced
+    /// idleness is the visible price of predictability.
+    pub fn all_runnable_are_capped(&self) -> bool {
+        let mut any_runnable = false;
+        for acc in self.accounts.values() {
+            if acc.runnable {
+                any_runnable = true;
+                if !Self::capped_out(acc) {
+                    return false;
+                }
+            }
+        }
+        any_runnable
+    }
+
+    /// Account `cycles` of GPU time that no tenant consumed, so a window
+    /// full of capped-out tenants still rolls over.
+    pub fn advance_idle(&mut self, cycles: Cycles) {
+        self.window_used += cycles;
+        self.roll_window_if_elapsed();
+    }
+
+    fn roll_window_if_elapsed(&mut self) {
+        if self.window_used >= QOS_WINDOW_CYCLES {
+            self.window_used = 0;
+            for acc in self.accounts.values_mut() {
+                acc.window_consumed = 0;
+            }
+        }
     }
 
     /// Remove a tenant (on destroy).
@@ -109,12 +235,22 @@ impl Scheduler {
     /// Ties break by `VgpuId` — arbitrary but *stable*, so a replayed
     /// trace schedules identically. Determinism is a feature the whole
     /// test suite (and, later, migration debugging) stands on.
+    /// Tenants over their cap are not candidates at all. Among those that
+    /// remain, any tenant still below its guaranteed floor is served
+    /// first — the reservation tier — and proportional share decides
+    /// within each tier. Two tiers is enough: a floor is a promise that
+    /// outranks fairness, and everything above its floor is back to
+    /// competing normally.
     pub fn pick(&mut self) -> Option<VgpuId> {
-        let chosen = self
-            .accounts
-            .iter()
-            .filter(|(_, a)| a.runnable)
+        let eligible = || {
+            self.accounts
+                .iter()
+                .filter(|(_, a)| a.runnable && !Self::capped_out(a))
+        };
+        let chosen = eligible()
+            .filter(|(_, a)| Self::under_floor(a))
             .min_by_key(|(id, a)| (a.vruntime, **id))
+            .or_else(|| eligible().min_by_key(|(id, a)| (a.vruntime, **id)))
             .map(|(id, _)| *id)?;
         let v = self.accounts[&chosen].vruntime;
         self.min_vruntime = self.min_vruntime.max(v);
@@ -126,7 +262,38 @@ impl Scheduler {
         if let Some(acc) = self.accounts.get_mut(&id) {
             acc.vruntime += cycles as u128 * SCALE / acc.weight as u128;
             acc.consumed += cycles;
+            acc.window_consumed += cycles;
         }
+        self.window_used += cycles;
+        self.roll_window_if_elapsed();
+    }
+
+    /// Cycles this tenant has taken inside the current QoS window
+    /// (telemetry: how close it is to its ceiling).
+    pub fn window_consumed(&self, id: VgpuId) -> Cycles {
+        self.accounts.get(&id).map_or(0, |a| a.window_consumed)
+    }
+
+    /// Adopt a window-consumption figure from elsewhere — a tenant that
+    /// migrated mid-window brings its spend with it.
+    ///
+    /// **Monotone upward on purpose.** The value can only ever raise the
+    /// tenant's recorded spend, never lower it, so the operation is
+    /// useless as an attack: a caller can throttle itself and nothing
+    /// else. That asymmetry is what makes it safe to expose on an
+    /// unauthenticated device API at all — the safe direction is the only
+    /// direction available.
+    pub fn adopt_window_consumed(&mut self, id: VgpuId, consumed: Cycles) {
+        if let Some(acc) = self.accounts.get_mut(&id) {
+            acc.window_consumed = acc.window_consumed.max(consumed);
+        }
+    }
+
+    /// Is this tenant currently held back by its own ceiling? Exposed
+    /// because "my job is slow" and "my job is slow *because I bought a
+    /// quarter card*" are different support tickets.
+    pub fn is_capped_out(&self, id: VgpuId) -> bool {
+        self.accounts.get(&id).is_some_and(Self::capped_out)
     }
 
     /// Total real cycles this tenant has consumed (metrics hook).

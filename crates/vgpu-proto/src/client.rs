@@ -12,6 +12,7 @@ use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 
 use vgpu_core::cmd::{ChannelExport, Command};
+use vgpu_core::metrics::NodeMetrics;
 use vgpu_core::types::{ChannelId, GpuVirtAddr, VgpuError, VgpuId};
 use vgpu_core::vgpu::{VgpuProfile, VgpuState};
 
@@ -204,6 +205,27 @@ impl VgpuClient {
             Response::Ticked(t) => Ok(t),
             _ => Err(ClientError::UnexpectedResponse("Tick")),
         }
+    }
+
+    /// Telemetry: a per-tenant and per-node metrics snapshot.
+    pub fn metrics(&mut self) -> ClientResult<NodeMetrics> {
+        match self.call(&Request::GetMetrics)? {
+            Response::Metrics(m) => Ok(m),
+            _ => Err(ClientError::UnexpectedResponse("GetMetrics")),
+        }
+    }
+
+    /// Migration: read a tenant's QoS window spend.
+    pub fn qos_window(&mut self, id: VgpuId) -> ClientResult<u64> {
+        match self.call(&Request::GetQosWindow(id))? {
+            Response::QosWindow(v) => Ok(v),
+            _ => Err(ClientError::UnexpectedResponse("GetQosWindow")),
+        }
+    }
+
+    /// Migration: carry a QoS window spend onto the destination.
+    pub fn adopt_qos_window(&mut self, vgpu: VgpuId, consumed: u64) -> ClientResult<()> {
+        self.expect_done(Request::AdoptQosWindow { vgpu, consumed }, "AdoptQosWindow")
     }
 
     /// Migration: allocate at a specific guest VA (heap-shape replay).
